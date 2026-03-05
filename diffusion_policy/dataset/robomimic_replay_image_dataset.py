@@ -385,45 +385,44 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                         raise RuntimeError('Failed to encode image!')
                 pbar.update(len(completed))
 
-        # save depth data (float32, no compression)
-        for key in tqdm(depth_keys, desc="Loading depth data"):
+        # save depth data (float32, no compression), frame by frame to save memory
+        for key in depth_keys:
             data_key = 'obs/' + key
             shape = tuple(shape_meta['obs'][key]['shape'])
             c, h, w = shape
-            this_data = list()
-            for i in range(len(demos)):
-                demo = demos[f'demo_{i}']
-                arr = demo[data_key][:].astype(np.float32)
-                # handle (T, H, W) -> (T, H, W, 1)
-                if arr.ndim == 3:
-                    arr = arr[..., np.newaxis]
-                this_data.append(arr)
-            this_data = np.concatenate(this_data, axis=0)
-            # auto-resize if HDF5 dimensions don't match shape_meta
-            src_h, src_w = this_data.shape[1], this_data.shape[2]
-            if src_h != h or src_w != w:
-                resized = np.empty((n_steps, h, w, c), dtype=np.float32)
-                for frame_idx in range(n_steps):
-                    frame = this_data[frame_idx]
-                    # squeeze channel for cv2.resize, then restore
-                    if frame.shape[-1] == 1:
-                        frame = frame[:, :, 0]
-                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_NEAREST)
-                    if frame.ndim == 2:
-                        frame = frame[:, :, np.newaxis]
-                    resized[frame_idx] = frame
-                this_data = resized
-            assert this_data.shape == (n_steps, h, w, c), \
-                f"Depth data shape mismatch for key '{key}': " \
-                f"expected {(n_steps, h, w, c)}, got {this_data.shape}"
-            _ = data_group.array(
+            # check if resize is needed by sampling the first frame
+            sample_frame = demos['demo_0'][data_key][0]
+            src_h, src_w = sample_frame.shape[:2]
+            need_resize = (src_h != h) or (src_w != w)
+            # pre-allocate zarr array
+            depth_arr = data_group.require_dataset(
                 name=key,
-                data=this_data,
-                shape=this_data.shape,
+                shape=(n_steps, h, w, c),
                 chunks=(1, h, w, c),
                 compressor=None,
                 dtype=np.float32
             )
+            # load frame by frame with per-frame progress bar
+            with tqdm(total=n_steps, desc=f"Loading depth data ({key})", mininterval=1.0) as pbar:
+                for episode_idx in range(len(demos)):
+                    demo = demos[f'demo_{episode_idx}']
+                    hdf5_arr = demo[data_key]
+                    for hdf5_idx in range(hdf5_arr.shape[0]):
+                        frame = hdf5_arr[hdf5_idx].astype(np.float32)
+                        # handle (H, W) -> (H, W, 1)
+                        if frame.ndim == 2:
+                            frame = frame[:, :, np.newaxis]
+                        if need_resize:
+                            # squeeze channel dim for cv2.resize, then restore
+                            if frame.shape[-1] == 1:
+                                frame = frame[:, :, 0]
+                            frame = cv2.resize(frame, (w, h),
+                                interpolation=cv2.INTER_NEAREST)
+                            if frame.ndim == 2:
+                                frame = frame[:, :, np.newaxis]
+                        zarr_idx = episode_starts[episode_idx] + hdf5_idx
+                        depth_arr[zarr_idx] = frame
+                        pbar.update(1)
 
     replay_buffer = ReplayBuffer(root)
     return replay_buffer
