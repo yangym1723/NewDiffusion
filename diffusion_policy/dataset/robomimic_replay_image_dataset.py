@@ -293,7 +293,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
         prev_end = 0
         for i in range(len(demos)):
             demo = demos[f'demo_{i}']
-            episode_length = demo['actions'].shape[0]
+            episode_length = demo['action'].shape[0]
             episode_end = prev_end + episode_length
             prev_end = episode_end
             episode_ends.append(episode_end)
@@ -306,7 +306,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
         for key in tqdm(lowdim_keys + ['action'], desc="Loading lowdim data"):
             data_key = 'obs/' + key
             if key == 'action':
-                data_key = 'actions'
+                data_key = 'action'
             this_data = list()
             for i in range(len(demos)):
                 demo = demos[f'demo_{i}']
