@@ -1,6 +1,7 @@
 from typing import Dict, List
 import torch
 import numpy as np
+import cv2
 import h5py
 from tqdm import tqdm
 import zarr
@@ -330,9 +331,14 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                 dtype=this_data.dtype
             )
         
-        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx):
+        def img_copy(zarr_arr, zarr_idx, hdf5_arr, hdf5_idx, target_h=None, target_w=None):
             try:
-                zarr_arr[zarr_idx] = hdf5_arr[hdf5_idx]
+                frame = hdf5_arr[hdf5_idx]
+                if target_h is not None and target_w is not None:
+                    src_h, src_w = frame.shape[:2]
+                    if src_h != target_h or src_w != target_w:
+                        frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+                zarr_arr[zarr_idx] = frame
                 # make sure we can successfully decode
                 _ = zarr_arr[zarr_idx]
                 return True
@@ -370,8 +376,9 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
 
                             zarr_idx = episode_starts[episode_idx] + hdf5_idx
                             futures.add(
-                                executor.submit(img_copy, 
-                                    img_arr, zarr_idx, hdf5_arr, hdf5_idx))
+                                executor.submit(img_copy,
+                                    img_arr, zarr_idx, hdf5_arr, hdf5_idx,
+                                    target_h=h, target_w=w))
                 completed, futures = concurrent.futures.wait(futures)
                 for f in completed:
                     if not f.result():
@@ -392,6 +399,20 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
                     arr = arr[..., np.newaxis]
                 this_data.append(arr)
             this_data = np.concatenate(this_data, axis=0)
+            # auto-resize if HDF5 dimensions don't match shape_meta
+            src_h, src_w = this_data.shape[1], this_data.shape[2]
+            if src_h != h or src_w != w:
+                resized = np.empty((n_steps, h, w, c), dtype=np.float32)
+                for frame_idx in range(n_steps):
+                    frame = this_data[frame_idx]
+                    # squeeze channel for cv2.resize, then restore
+                    if frame.shape[-1] == 1:
+                        frame = frame[:, :, 0]
+                    frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_NEAREST)
+                    if frame.ndim == 2:
+                        frame = frame[:, :, np.newaxis]
+                    resized[frame_idx] = frame
+                this_data = resized
             assert this_data.shape == (n_steps, h, w, c), \
                 f"Depth data shape mismatch for key '{key}': " \
                 f"expected {(n_steps, h, w, c)}, got {this_data.shape}"
