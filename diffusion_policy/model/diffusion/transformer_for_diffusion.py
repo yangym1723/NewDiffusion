@@ -22,7 +22,8 @@ class TransformerForDiffusion(ModuleAttrMixin):
             causal_attn: bool=False,
             time_as_cond: bool=True,
             obs_as_cond: bool=False,
-            n_cond_layers: int = 0
+            n_cond_layers: int = 0,
+            cumact_input_dim: int = 0
         ) -> None:
         super().__init__()
 
@@ -51,6 +52,15 @@ class TransformerForDiffusion(ModuleAttrMixin):
         
         if obs_as_cond:
             self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
+
+        # cumulative action history encoder
+        self.cumact_encoder = None
+        if cumact_input_dim > 0:
+            self.cumact_encoder = nn.Sequential(
+                nn.Linear(cumact_input_dim, n_emb),
+                nn.Mish(),
+                nn.Linear(n_emb, n_emb)
+            )
 
         self.cond_pos_emb = None
         self.encoder = None
@@ -267,14 +277,16 @@ class TransformerForDiffusion(ModuleAttrMixin):
         )
         return optimizer
 
-    def forward(self, 
-        sample: torch.Tensor, 
-        timestep: Union[torch.Tensor, float, int], 
-        cond: Optional[torch.Tensor]=None, **kwargs):
+    def forward(self,
+        sample: torch.Tensor,
+        timestep: Union[torch.Tensor, float, int],
+        cond: Optional[torch.Tensor]=None,
+        cumact: Optional[torch.Tensor]=None, **kwargs):
         """
         x: (B,T,input_dim)
         timestep: (B,) or int, diffusion step
         cond: (B,T',cond_dim)
+        cumact: (B,T,cumact_input_dim) cumulative action history
         output: (B,T,input_dim)
         """
         # 1. time
@@ -291,6 +303,11 @@ class TransformerForDiffusion(ModuleAttrMixin):
 
         # process input
         input_emb = self.input_emb(sample)
+
+        # add cumulative action history encoding
+        if self.cumact_encoder is not None and cumact is not None:
+            cumact_emb = self.cumact_encoder(cumact)
+            input_emb = input_emb + cumact_emb
 
         if self.encoder_only:
             # BERT

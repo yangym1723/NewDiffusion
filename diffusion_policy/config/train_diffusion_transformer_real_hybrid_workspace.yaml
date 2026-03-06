@@ -54,6 +54,7 @@ policy:
   causal_attn: True
   time_as_cond: True # if false, use BERT like encoder only arch, time as input
   obs_as_cond: ${obs_as_cond}
+  use_cumact_encoder: True
 
   # scheduler.step params
   # predict_epsilon: True

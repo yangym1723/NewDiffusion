@@ -20,12 +20,12 @@ from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
 
 class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
-    def __init__(self, 
+    def __init__(self,
             shape_meta: dict,
             noise_scheduler: DDPMScheduler,
             # task params
-            horizon, 
-            n_action_steps, 
+            horizon,
+            n_action_steps,
             n_obs_steps,
             num_inference_steps=None,
             # image
@@ -43,6 +43,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             time_as_cond=True,
             obs_as_cond=True,
             pred_action_steps_only=False,
+            # cumulative action history encoder
+            use_cumact_encoder=False,
             # parameters passed to step
             **kwargs):
         super().__init__()
@@ -141,6 +143,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         output_dim = input_dim
         cond_dim = obs_feature_dim if obs_as_cond else 0
 
+        cumact_input_dim = action_dim if use_cumact_encoder else 0
+
         model = TransformerForDiffusion(
             input_dim=input_dim,
             output_dim=output_dim,
@@ -155,7 +159,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             causal_attn=causal_attn,
             time_as_cond=time_as_cond,
             obs_as_cond=obs_as_cond,
-            n_cond_layers=n_cond_layers
+            n_cond_layers=n_cond_layers,
+            cumact_input_dim=cumact_input_dim
         )
 
         self.obs_encoder = obs_encoder
@@ -176,6 +181,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.n_obs_steps = n_obs_steps
         self.obs_as_cond = obs_as_cond
         self.pred_action_steps_only = pred_action_steps_only
+        self.use_cumact_encoder = use_cumact_encoder
         self.kwargs = kwargs
 
         if num_inference_steps is None:
@@ -183,7 +189,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         self.num_inference_steps = num_inference_steps
     
     # ========= inference  ============
-    def conditional_sample(self, 
+    def conditional_sample(self,
             condition_data, condition_mask,
             cond=None, generator=None,
             # keyword arguments to scheduler.step
@@ -191,32 +197,55 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             ):
         model = self.model
         scheduler = self.noise_scheduler
+        use_cumact = (model.cumact_encoder is not None)
 
         trajectory = torch.randn(
-            size=condition_data.shape, 
+            size=condition_data.shape,
             dtype=condition_data.dtype,
             device=condition_data.device,
             generator=generator)
-    
+
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
+
+        # initialize cumact as zeros for first DDIM step
+        cumact = None
+        if use_cumact:
+            cumact = torch.zeros(
+                condition_data.shape[0], condition_data.shape[1],
+                self.action_dim, device=condition_data.device,
+                dtype=condition_data.dtype)
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
             trajectory[condition_mask] = condition_data[condition_mask]
 
             # 2. predict model output
-            model_output = model(trajectory, t, cond)
+            model_output = model(trajectory, t, cond, cumact=cumact)
 
             # 3. compute previous image: x_t -> x_t-1
-            trajectory = scheduler.step(
-                model_output, t, trajectory, 
+            step_output = scheduler.step(
+                model_output, t, trajectory,
                 generator=generator,
                 **kwargs
-                ).prev_sample
-        
+                )
+            trajectory = step_output.prev_sample
+
+            # 4. update cumact from predicted clean trajectory (x0 estimate)
+            if use_cumact:
+                pred_x0 = step_output.pred_original_sample
+                if pred_x0 is not None:
+                    # only use action dims (relevant when obs_as_cond=False)
+                    pred_x0_act = pred_x0[..., :self.action_dim]
+                    cs = torch.cumsum(pred_x0_act, dim=1)
+                    # right-shift: cumact[t] = sum(x0[0:t])
+                    cumact = torch.cat([
+                        torch.zeros_like(cs[:, :1, :]),
+                        cs[:, :-1, :]
+                    ], dim=1)
+
         # finally make sure conditioning is enforced
-        trajectory[condition_mask] = condition_data[condition_mask]        
+        trajectory[condition_mask] = condition_data[condition_mask]
 
         return trajectory
 
@@ -322,12 +351,22 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         horizon = nactions.shape[1]
         To = self.n_obs_steps
 
+        # compute cumulative action history from ground truth (teacher forcing)
+        # cumact[t] = sum(nactions[0:t]), right-shifted so cumact[0] = 0
+        cumact = None
+        if self.model.cumact_encoder is not None:
+            full_cumact = torch.cumsum(nactions, dim=1)
+            full_cumact = torch.cat([
+                torch.zeros_like(full_cumact[:, :1, :]),
+                full_cumact[:, :-1, :]
+            ], dim=1)
+
         # handle different ways of passing observation
         cond = None
         trajectory = nactions
         if self.obs_as_cond:
             # reshape B, T, ... to B*T
-            this_nobs = dict_apply(nobs, 
+            this_nobs = dict_apply(nobs,
                 lambda x: x[:,:To,...].reshape(-1,*x.shape[2:]))
             nobs_features = self.obs_encoder(this_nobs)
             # reshape back to B, T, Do
@@ -336,6 +375,11 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                 start = To - 1
                 end = start + self.n_action_steps
                 trajectory = nactions[:,start:end]
+                if self.model.cumact_encoder is not None:
+                    cumact = full_cumact[:, start:end]
+            else:
+                if self.model.cumact_encoder is not None:
+                    cumact = full_cumact
         else:
             # reshape B, T, ... to B*T
             this_nobs = dict_apply(nobs, lambda x: x.reshape(-1, *x.shape[2:]))
@@ -343,6 +387,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             # reshape back to B, T, Do
             nobs_features = nobs_features.reshape(batch_size, horizon, -1)
             trajectory = torch.cat([nactions, nobs_features], dim=-1).detach()
+            if self.model.cumact_encoder is not None:
+                cumact = full_cumact
 
         # generate impainting mask
         if self.pred_action_steps_only:
@@ -355,7 +401,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         bsz = trajectory.shape[0]
         # Sample a random timestep for each image
         timesteps = torch.randint(
-            0, self.noise_scheduler.config.num_train_timesteps, 
+            0, self.noise_scheduler.config.num_train_timesteps,
             (bsz,), device=trajectory.device
         ).long()
         # Add noise to the clean images according to the noise magnitude at each timestep
@@ -368,11 +414,11 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         # apply conditioning
         noisy_trajectory[condition_mask] = trajectory[condition_mask]
-        
-        # Predict the noise residual
-        pred = self.model(noisy_trajectory, timesteps, cond)
 
-        pred_type = self.noise_scheduler.config.prediction_type 
+        # Predict the noise residual
+        pred = self.model(noisy_trajectory, timesteps, cond, cumact=cumact)
+
+        pred_type = self.noise_scheduler.config.prediction_type
         if pred_type == 'epsilon':
             target = noise
         elif pred_type == 'sample':
