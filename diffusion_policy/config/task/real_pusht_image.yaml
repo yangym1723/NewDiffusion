@@ -21,7 +21,7 @@ shape_meta: &shape_meta
       type: low_dim
     contact_force_z:
       shape: [3]
-      type: lowdim
+      type: low_dim
   action: 
     shape: [10]
 
