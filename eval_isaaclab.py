@@ -23,11 +23,6 @@ python eval_isaaclab.py \
     --n_test_vis 3
 """
 
-import sys
-# Use line-buffering for both stdout and stderr
-sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
-sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
-
 import argparse
 
 # ============================================================
@@ -50,8 +45,6 @@ AppLauncher.add_app_launcher_args(parser)
 
 # Parse all args
 args = parser.parse_args()
-# Ensure cameras are enabled (needed for camera observations)
-args.enable_cameras = True
 
 # Launch the simulation app
 app_launcher = AppLauncher(args)
