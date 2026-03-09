@@ -341,13 +341,12 @@ class IsaacLabImageRunner(BaseImageRunner):
         writer.release()
 
     def run(self, policy: BaseImagePolicy) -> Dict:
-        """Run evaluation rollouts in IsaacLab environment.
+        """Run evaluation rollouts in IsaacLab environment with temporal ensemble.
 
-        For each test episode:
-        1. Reset the environment
-        2. Run the policy in a loop, feeding stacked observations
-        3. Record video frames (for the first n_test_vis episodes)
-        4. Collect rewards
+        Uses temporal ensemble to blend overlapping action chunks, reducing
+        jitter at chunk boundaries. The policy is queried every
+        `n_action_steps` env steps, and all overlapping chunks are blended
+        with exponential decay weights.
 
         Returns a dict of loggable data for wandb.
         """
@@ -357,9 +356,18 @@ class IsaacLabImageRunner(BaseImageRunner):
         device = policy.device
         env = self._env
 
+        # Temporal ensemble config
+        query_frequency = self.n_action_steps
+        temporal_ensemble_k = 0.01  # exp decay: w[i] = exp(-k * i)
+
+        # Determine action_dim from shape_meta
+        action_dim = self.shape_meta['action']['shape'][0]
+
         log_data = {}
         all_rewards = []
         max_rewards = collections.defaultdict(list)
+
+        max_env_steps = self.max_steps * query_frequency
 
         for ep_idx in range(self.n_test):
             seed = self.test_start_seed + ep_idx
@@ -376,82 +384,99 @@ class IsaacLabImageRunner(BaseImageRunner):
             done = False
             step_count = 0
 
+            # Temporal ensemble state: list of (start_step, action_chunk_np)
+            all_action_chunks = []
+
             pbar = tqdm.tqdm(
-                total=self.max_steps,
+                total=max_env_steps,
                 desc=f"Eval ThreeFingers ep {ep_idx+1}/{self.n_test}",
                 leave=False,
                 mininterval=self.tqdm_interval_sec,
             )
 
-            while not done and step_count < self.max_steps:
-                # Stack observations for policy input
-                stacked_obs = self._obs_to_stacked(obs_history, self.n_obs_steps)
+            while not done and step_count < max_env_steps:
+                # Query policy when needed
+                if step_count % query_frequency == 0:
+                    stacked_obs = self._obs_to_stacked(obs_history, self.n_obs_steps)
+                    obs_dict = {}
+                    for key, val in stacked_obs.items():
+                        obs_dict[key] = torch.from_numpy(val).to(
+                            device=device, dtype=torch.float32)
 
-                # Convert to torch tensors on policy device
-                obs_dict = {}
-                for key, val in stacked_obs.items():
-                    obs_dict[key] = torch.from_numpy(val).to(device=device, dtype=torch.float32)
+                    with torch.no_grad():
+                        action_dict = policy.predict_action(obs_dict)
 
-                # Run policy
-                with torch.no_grad():
-                    action_dict = policy.predict_action(obs_dict)
+                    action_chunk = action_dict["action"].detach().cpu().numpy()
+                    all_action_chunks.append((step_count, action_chunk))
 
-                # Get action chunk: (B, Ta, Da)
-                action = action_dict["action"].detach().cpu().numpy()
+                # Temporal ensemble: blend all overlapping chunks
+                batch_size = all_action_chunks[0][1].shape[0]
+                blended_action = np.zeros((batch_size, action_dim), dtype=np.float32)
+                total_weight = np.zeros((batch_size, action_dim), dtype=np.float32)
 
-                # Execute each action in the chunk
-                for act_idx in range(min(self.n_action_steps, action.shape[1])):
-                    if done:
-                        break
-
-                    single_action = action[:, act_idx, :]  # (B, Da)
-                    single_action_tensor = torch.from_numpy(single_action).to(
-                        device=env.unwrapped.device, dtype=torch.float32
-                    )
-
-                    try:
-                        isaac_obs, reward, terminated, truncated, info = env.step(single_action_tensor)
-                    except torch._C._LinAlgError as e:
-                        print(f"  [WARN] IK singularity at step {step_count}, "
-                              f"action chunk {act_idx}: {e}. Skipping action.")
+                for chunk_start, chunk in all_action_chunks:
+                    idx_in_chunk = step_count - chunk_start
+                    if idx_in_chunk < 0 or idx_in_chunk >= chunk.shape[1]:
                         continue
+                    weight = np.exp(-temporal_ensemble_k * idx_in_chunk)
+                    blended_action += weight * chunk[:, idx_in_chunk, :]
+                    total_weight += weight
 
-                    obs = self._extract_obs(isaac_obs, env)
-                    # Keep obs_history bounded
-                    obs_history.append(obs)
-                    if len(obs_history) > self.n_obs_steps + 1:
-                        obs_history.pop(0)
+                total_weight = np.maximum(total_weight, 1e-8)
+                blended_action = blended_action / total_weight
 
-                    # Collect reward
-                    if isinstance(reward, torch.Tensor):
-                        reward_val = reward.cpu().numpy()
-                    else:
-                        reward_val = np.array(reward)
-                    episode_rewards.append(reward_val.mean())
+                # Remove fully consumed chunks
+                all_action_chunks = [
+                    (s, c) for s, c in all_action_chunks
+                    if s + c.shape[1] > step_count
+                ]
 
-                    # Check done
-                    if isinstance(terminated, torch.Tensor):
-                        terminated = terminated.cpu().numpy()
-                    if isinstance(truncated, torch.Tensor):
-                        truncated = truncated.cpu().numpy()
-                    done = np.any(terminated) or np.any(truncated)
+                # Execute blended action
+                action_tensor = torch.from_numpy(blended_action).to(
+                    device=env.unwrapped.device, dtype=torch.float32
+                )
 
-                    # Record video frame
-                    if enable_render:
-                        try:
-                            frame = env.render()
-                            if isinstance(frame, torch.Tensor):
-                                frame = frame.cpu().numpy()
-                            if frame is not None:
-                                if frame.dtype != np.uint8:
-                                    frame = (frame * 255).astype(np.uint8)
-                                # Handle batch dimension
-                                if frame.ndim == 4:
-                                    frame = frame[0]
-                                video_frames.append(frame)
-                        except Exception:
-                            # Rendering may fail in some configurations
-                            pass
+                try:
+                    isaac_obs, reward, terminated, truncated, info = env.step(action_tensor)
+                except torch._C._LinAlgError as e:
+                    print(f"  [WARN] IK singularity at step {step_count}: {e}. Skipping.")
+                    step_count += 1
+                    pbar.update(1)
+                    continue
+
+                obs = self._extract_obs(isaac_obs, env)
+                obs_history.append(obs)
+                if len(obs_history) > self.n_obs_steps + 1:
+                    obs_history.pop(0)
+
+                # Collect reward
+                if isinstance(reward, torch.Tensor):
+                    reward_val = reward.cpu().numpy()
+                else:
+                    reward_val = np.array(reward)
+                episode_rewards.append(reward_val.mean())
+
+                # Check done
+                if isinstance(terminated, torch.Tensor):
+                    terminated = terminated.cpu().numpy()
+                if isinstance(truncated, torch.Tensor):
+                    truncated = truncated.cpu().numpy()
+                done = np.any(terminated) or np.any(truncated)
+
+                # Record video frame
+                if enable_render:
+                    try:
+                        frame = env.render()
+                        if isinstance(frame, torch.Tensor):
+                            frame = frame.cpu().numpy()
+                        if frame is not None:
+                            if frame.dtype != np.uint8:
+                                frame = (frame * 255).astype(np.uint8)
+                            if frame.ndim == 4:
+                                frame = frame[0]
+                            video_frames.append(frame)
+                    except Exception:
+                        pass
 
                 step_count += 1
                 pbar.update(1)

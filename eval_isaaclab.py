@@ -14,7 +14,7 @@ Example:
         -o data/eval_output \
         --headless
 # 使用专用的 IsaacLab eval 脚本
-ython eval_isaaclab.py     -c data/outputs/2026.03.06/21.45.55_train_diffusion_transformer_hybrid_real_image/checkpoints/epoch=0560-train_loss=0.001.ckpt     -o data/eval_output     --task Template-Threefingers-v0     --enable_cameras     --n_test 10     --n_test_vis 3
+python eval_isaaclab.py     -c data/outputs/2026.03.06/21.45.55_train_diffusion_transformer_hybrid_real_image/checkpoints/epoch=0560-train_loss=0.001.ckpt     -o data/eval_output     --task Template-Threefingers-v0     --enable_cameras     --n_test 10     --n_test_vis 3
 """
 
 import argparse
@@ -91,7 +91,7 @@ def extract_obs(isaac_obs, env, image_shape, depth_shape):
     Returns a dict with keys matching the shape_meta:
         camera_rgb:      np.array (N, 3, H, W) float32 in [0,1]
         camera_depth:    np.array (N, 1, H, W) float32
-        ee_pos:          np.array (N, 3) float32
+        ee_pose:         np.array (N, 3) float32
         ee_quat:         np.array (N, 4) float32
         contact_force_z: np.array (N, 3) float32
     """
@@ -102,12 +102,12 @@ def extract_obs(isaac_obs, env, image_shape, depth_shape):
     ee_frame = unwrapped.scene["ee_frame"]
     robot = unwrapped.scene["robot"]
 
-    # ee_pos: EE position in robot root frame
-    ee_pos, _ = subtract_frame_transforms(
+    # ee_pose: EE position in robot root frame
+    ee_pose, _ = subtract_frame_transforms(
         robot.data.root_pos_w, robot.data.root_quat_w,
         ee_frame.data.target_pos_w[:, 0, :]
     )
-    result["ee_pos"] = ee_pos.cpu().numpy().astype(np.float32)
+    result["ee_pose"] = ee_pose.cpu().numpy().astype(np.float32)
 
     # ee_quat: EE quaternion in world frame
     ee_quat = ee_frame.data.target_quat_w[:, 0, :]
@@ -288,6 +288,14 @@ def main():
     max_rewards = collections.defaultdict(list)
     test_start_seed = 10000
 
+    # Temporal ensemble parameters
+    # Re-query the policy every `query_frequency` env steps.
+    # All overlapping action chunks are blended with exponential weights.
+    query_frequency = n_action_steps  # query every n_action_steps (same timing)
+    temporal_ensemble_k = 0.01  # exponential weight decay: w[i] = exp(-k * i)
+
+    action_dim = shape_meta['action']['shape'][0]
+
     for ep_idx in range(n_test):
         seed = test_start_seed + ep_idx
         enable_render = ep_idx < n_test_vis
@@ -300,83 +308,109 @@ def main():
         episode_rewards = []
         video_frames = []
         done = False
-        step_count = 0
+        step_count = 0  # total env steps executed
+        chunk_count = 0  # number of policy queries made
+
+        # Temporal ensemble: store all predicted action chunks
+        # Each entry: (start_step, action_chunk) where action_chunk is (B, Ta, Da)
+        all_action_chunks = []
 
         pbar = tqdm.tqdm(
-            total=max_steps,
+            total=max_steps * query_frequency,
             desc=f"Eval ThreeFingers ep {ep_idx+1}/{n_test}",
             leave=False,
             mininterval=5.0,
         )
 
-        while not done and step_count < max_steps:
-            # Stack observations
-            stacked_obs = stack_obs(obs_history, n_obs_steps)
+        while not done and step_count < max_steps * query_frequency:
+            # Query policy when needed (every query_frequency steps, or at step 0)
+            if step_count % query_frequency == 0:
+                # Stack observations
+                stacked_obs = stack_obs(obs_history, n_obs_steps)
+                obs_dict = {}
+                for key, val in stacked_obs.items():
+                    obs_dict[key] = torch.from_numpy(val).to(device=device, dtype=torch.float32)
 
-            # To torch
-            obs_dict = {}
-            for key, val in stacked_obs.items():
-                obs_dict[key] = torch.from_numpy(val).to(device=device, dtype=torch.float32)
+                # Policy inference
+                with torch.no_grad():
+                    action_dict = policy.predict_action(obs_dict)
+                action_chunk = action_dict["action"].detach().cpu().numpy()  # (B, Ta, Da)
+                all_action_chunks.append((step_count, action_chunk))
+                chunk_count += 1
 
-            # Policy inference
-            with torch.no_grad():
-                action_dict = policy.predict_action(obs_dict)
+            # Temporal ensemble: blend all overlapping action chunks
+            batch_size = all_action_chunks[0][1].shape[0]
+            blended_action = np.zeros((batch_size, action_dim), dtype=np.float32)
+            total_weight = np.zeros((batch_size, action_dim), dtype=np.float32)
 
-            action = action_dict["action"].detach().cpu().numpy()  # (B, Ta, Da)
-
-            # Execute action chunk
-            for act_idx in range(min(n_action_steps, action.shape[1])):
-                if done:
-                    break
-
-                single_action = action[:, act_idx, :]  # (B, Da)
-                action_tensor = torch.from_numpy(single_action).to(
-                    device=env.unwrapped.device, dtype=torch.float32
-                )
-
-                try:
-                    isaac_obs, reward, terminated, truncated, info = env.step(action_tensor)
-                except torch._C._LinAlgError as e:
-                    print(f"  [WARN] IK singularity at step {step_count}, "
-                          f"action chunk {act_idx}: {e}. Skipping action.")
+            for chunk_start, chunk in all_action_chunks:
+                idx_in_chunk = step_count - chunk_start
+                if idx_in_chunk < 0 or idx_in_chunk >= chunk.shape[1]:
                     continue
+                # Exponential weight: newer chunks (larger idx_in_chunk=0) get higher weight
+                weight = np.exp(-temporal_ensemble_k * idx_in_chunk)
+                blended_action += weight * chunk[:, idx_in_chunk, :]
+                total_weight += weight
 
-                obs = extract_obs(isaac_obs, env, image_shape, depth_shape)
-                obs_history.append(obs)
-                if len(obs_history) > n_obs_steps + 1:
-                    obs_history.pop(0)
+            # Avoid division by zero
+            total_weight = np.maximum(total_weight, 1e-8)
+            blended_action = blended_action / total_weight
 
-                # Reward
-                if isinstance(reward, torch.Tensor):
-                    rew = reward.cpu().numpy()
-                else:
-                    rew = np.array(reward)
-                episode_rewards.append(rew.mean())
+            # Remove chunks that are fully consumed (no longer overlap with current step)
+            all_action_chunks = [
+                (s, c) for s, c in all_action_chunks
+                if s + c.shape[1] > step_count
+            ]
 
-                # Done check
-                if isinstance(terminated, torch.Tensor):
-                    terminated = terminated.cpu().numpy()
-                if isinstance(truncated, torch.Tensor):
-                    truncated = truncated.cpu().numpy()
-                done = bool(np.any(terminated) or np.any(truncated))
+            # Execute blended action
+            action_tensor = torch.from_numpy(blended_action).to(
+                device=env.unwrapped.device, dtype=torch.float32
+            )
 
-                # Video recording
-                if enable_render:
-                    try:
-                        frame = env.render()
-                        if isinstance(frame, torch.Tensor):
-                            frame = frame.cpu().numpy()
-                        if frame is not None:
-                            if frame.dtype != np.uint8:
-                                if frame.max() <= 1.0:
-                                    frame = (frame * 255).astype(np.uint8)
-                                else:
-                                    frame = frame.astype(np.uint8)
-                            if frame.ndim == 4:
-                                frame = frame[0]
-                            video_frames.append(frame)
-                    except Exception:
-                        pass
+            try:
+                isaac_obs, reward, terminated, truncated, info = env.step(action_tensor)
+            except torch._C._LinAlgError as e:
+                print(f"  [WARN] IK singularity at step {step_count}: {e}. Skipping.")
+                step_count += 1
+                pbar.update(1)
+                continue
+
+            obs = extract_obs(isaac_obs, env, image_shape, depth_shape)
+            obs_history.append(obs)
+            if len(obs_history) > n_obs_steps + 1:
+                obs_history.pop(0)
+
+            # Reward
+            if isinstance(reward, torch.Tensor):
+                rew = reward.cpu().numpy()
+            else:
+                rew = np.array(reward)
+            episode_rewards.append(rew.mean())
+
+            # Done check
+            if isinstance(terminated, torch.Tensor):
+                terminated = terminated.cpu().numpy()
+            if isinstance(truncated, torch.Tensor):
+                truncated = truncated.cpu().numpy()
+            done = bool(np.any(terminated) or np.any(truncated))
+
+            # Video recording
+            if enable_render:
+                try:
+                    frame = env.render()
+                    if isinstance(frame, torch.Tensor):
+                        frame = frame.cpu().numpy()
+                    if frame is not None:
+                        if frame.dtype != np.uint8:
+                            if frame.max() <= 1.0:
+                                frame = (frame * 255).astype(np.uint8)
+                            else:
+                                frame = frame.astype(np.uint8)
+                        if frame.ndim == 4:
+                            frame = frame[0]
+                        video_frames.append(frame)
+                except Exception:
+                    pass
 
             step_count += 1
             pbar.update(1)
