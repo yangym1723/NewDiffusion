@@ -104,7 +104,7 @@ def extract_obs(isaac_obs, env, image_shape, depth_shape):
     Returns a dict with keys matching the shape_meta:
         camera_rgb:      np.array (N, 3, H, W) float32 in [0,1]
         camera_depth:    np.array (N, 1, H, W) float32
-        ee_pose:         np.array (N, 3) float32
+        ee_pos:          np.array (N, 3) float32
         ee_quat:         np.array (N, 4) float32
         contact_force_z: np.array (N, 3) float32
     """
@@ -115,12 +115,12 @@ def extract_obs(isaac_obs, env, image_shape, depth_shape):
     ee_frame = unwrapped.scene["ee_frame"]
     robot = unwrapped.scene["robot"]
 
-    # ee_pose: EE position in robot root frame
+    # ee_pos: EE position in robot root frame
     ee_pos, _ = subtract_frame_transforms(
         robot.data.root_pos_w, robot.data.root_quat_w,
         ee_frame.data.target_pos_w[:, 0, :]
     )
-    result["ee_pose"] = ee_pos.cpu().numpy().astype(np.float32)
+    result["ee_pos"] = ee_pos.cpu().numpy().astype(np.float32)
 
     # ee_quat: EE quaternion in world frame
     ee_quat = ee_frame.data.target_quat_w[:, 0, :]
