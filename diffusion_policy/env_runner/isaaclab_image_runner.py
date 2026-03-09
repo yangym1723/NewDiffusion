@@ -409,7 +409,12 @@ class IsaacLabImageRunner(BaseImageRunner):
                         device=env.unwrapped.device, dtype=torch.float32
                     )
 
-                    isaac_obs, reward, terminated, truncated, info = env.step(single_action_tensor)
+                    try:
+                        isaac_obs, reward, terminated, truncated, info = env.step(single_action_tensor)
+                    except torch._C._LinAlgError as e:
+                        print(f"  [WARN] IK singularity at step {step_count}, "
+                              f"action chunk {act_idx}: {e}. Skipping action.")
+                        continue
 
                     obs = self._extract_obs(isaac_obs, env)
                     # Keep obs_history bounded

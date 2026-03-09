@@ -14,13 +14,7 @@ Example:
         -o data/eval_output \
         --headless
 # 使用专用的 IsaacLab eval 脚本
-python eval_isaaclab.py \
-    -c path/to/your/checkpoint.ckpt \
-    -o data/eval_output \
-    --task Template-Threefingers-v0 \
-    --headless \
-    --n_test 10 \
-    --n_test_vis 3
+ython eval_isaaclab.py     -c data/outputs/2026.03.06/21.45.55_train_diffusion_transformer_hybrid_real_image/checkpoints/epoch=0560-train_loss=0.001.ckpt     -o data/eval_output     --task Template-Threefingers-v0     --enable_cameras     --n_test 10     --n_test_vis 3
 """
 
 import argparse
@@ -340,7 +334,12 @@ def main():
                     device=env.unwrapped.device, dtype=torch.float32
                 )
 
-                isaac_obs, reward, terminated, truncated, info = env.step(action_tensor)
+                try:
+                    isaac_obs, reward, terminated, truncated, info = env.step(action_tensor)
+                except torch._C._LinAlgError as e:
+                    print(f"  [WARN] IK singularity at step {step_count}, "
+                          f"action chunk {act_idx}: {e}. Skipping action.")
+                    continue
 
                 obs = extract_obs(isaac_obs, env, image_shape, depth_shape)
                 obs_history.append(obs)
