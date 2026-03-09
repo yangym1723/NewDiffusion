@@ -37,7 +37,7 @@ import argparse
 parser = argparse.ArgumentParser(description="Evaluate diffusion policy in IsaacLab simulation")
 parser.add_argument("-c", "--checkpoint", required=True, help="Path to .ckpt checkpoint file")
 parser.add_argument("-o", "--output_dir", required=True, help="Output directory for eval results")
-parser.add_argument("-d", "--device", default="cuda:0", help="Device for policy inference")
+parser.add_argument("-d", "--policy_device", default="cuda:0", help="Device for policy inference")
 parser.add_argument("--task", default="Template-Threefingers-v0", help="IsaacLab task gym ID")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel environments")
 parser.add_argument("--n_test", type=int, default=10, help="Number of test episodes")
@@ -235,7 +235,7 @@ def save_video(frames, file_path, fps):
 def main():
     checkpoint_path = args.checkpoint
     output_dir = args.output_dir
-    policy_device = args.device
+    policy_device = args.policy_device
     task_name = args.task
     num_envs = args.num_envs
     n_test = args.n_test
