@@ -13,7 +13,7 @@ shape_meta: &shape_meta
     camera_rgb:
       shape: *image_shape
       type: rgb
-    ee_pos:
+    ee_pose:
       shape: [3]
       type: low_dim
     ee_quat:
@@ -26,7 +26,24 @@ shape_meta: &shape_meta
     shape: [10]
 
 env_runner:
-  _target_: diffusion_policy.env_runner.real_pusht_image_runner.RealPushTImageRunner
+  _target_: diffusion_policy.env_runner.isaaclab_image_runner.IsaacLabImageRunner
+  shape_meta: *shape_meta
+  task_name: "Template-Threefingers-v0"
+  n_test: 10
+  n_test_vis: 3
+  test_start_seed: 10000
+  max_steps: 750
+  n_obs_steps: ${n_obs_steps}
+  n_action_steps: ${n_action_steps}
+  fps: 10
+  crf: 22
+  past_action: ${past_action_visible}
+  n_envs: 1
+  image_shape: *image_shape
+  depth_shape: *depth_shape
+  enable_cameras: True
+  headless: True
+  device: "cuda:0"
 
 dataset:
   _target_: diffusion_policy.dataset.robomimic_replay_image_dataset.RobomimicReplayImageDataset
