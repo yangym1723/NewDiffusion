@@ -221,10 +221,14 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                     -1, condition_data.shape[1], -1)
                 cumact = self.normalizer['cumact'].normalize(raw_offset_expanded)
             else:
-                cumact = torch.zeros(
+                # No episode offset provided; treat as episode start (raw cumact = 0).
+                # Must normalize rather than using literal zeros, because
+                # normalize(0) = offset ≠ 0 in general for affine normalizers.
+                raw_zero = torch.zeros(
                     condition_data.shape[0], condition_data.shape[1],
                     self.action_dim, device=condition_data.device,
                     dtype=condition_data.dtype)
+                cumact = self.normalizer['cumact'].normalize(raw_zero)
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
@@ -401,7 +405,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             raw_actions = batch['actions']               # (B, T, Da)  raw
             raw_offset  = batch['cumact_offset']         # (B, Da)     raw
 
-            # Prepare raw actions for cumact: zero binary dims + left-pad
+            # Prepare raw actions for cumact: zero binary dims + padded positions
             raw_for_cumact = raw_actions.clone()
             if self.binary_action_dims is not None:
                 for dim in self.binary_action_dims:
@@ -411,6 +415,11 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                     pl = batch['pad_left'][i].item()
                     if pl > 0:
                         raw_for_cumact[i, :pl, :] = 0.0
+            if 'pad_right' in batch:
+                for i in range(batch_size):
+                    pr = batch['pad_right'][i].item()
+                    if pr > 0:
+                        raw_for_cumact[i, -pr:, :] = 0.0
 
             # Intra-window cumulative sum, right-shifted
             raw_cs = torch.cumsum(raw_for_cumact, dim=1)

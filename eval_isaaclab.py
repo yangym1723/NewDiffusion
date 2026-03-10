@@ -311,7 +311,7 @@ def main():
         # Reset with deterministic seed for reproducibility
         torch.manual_seed(seed)
         np.random.seed(seed)
-        isaac_obs, info = env.reset()
+        isaac_obs, info = env.reset(seed=seed)
         obs = extract_obs(isaac_obs, env, image_shape, depth_shape)
         obs_history = [obs]
 

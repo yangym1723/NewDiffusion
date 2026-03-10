@@ -287,11 +287,16 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         # Used by compute_loss to zero out padded positions before cumact cumsum.
         pad_left = int(self.sampler.indices[idx][2])  # sample_start_idx
 
+        # Number of right-padded steps (replicated last action).
+        # Used by compute_loss to zero out padded positions before cumact cumsum.
+        pad_right = int(self.sampler.sequence_length - self.sampler.indices[idx][3])
+
         torch_data = {
             'obs': dict_apply(obs_dict, torch.from_numpy),
             'actions': torch.from_numpy(data['actions'].astype(np.float32)),
             'cumact_offset': torch.from_numpy(cumact_offset),
-            'pad_left': torch.tensor(pad_left, dtype=torch.long)
+            'pad_left': torch.tensor(pad_left, dtype=torch.long),
+            'pad_right': torch.tensor(pad_right, dtype=torch.long)
         }
         return torch_data
 
