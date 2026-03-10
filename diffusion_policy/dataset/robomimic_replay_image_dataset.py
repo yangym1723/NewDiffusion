@@ -218,7 +218,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         for key in self.lowdim_keys:
             stat = array_to_stats(self.replay_buffer[key])
 
-            if key.endswith('pos'):
+            if key.endswith('pose'):
                 this_normalizer = get_range_normalizer_from_stat(stat)
             elif key.endswith('quat'):
                 # quaternion is in [-1,1] already
