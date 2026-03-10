@@ -50,9 +50,11 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         super().__init__()
 
         # parse shape_meta
-        action_shape = shape_meta['action']['shape']
+        action_shape = shape_meta['actions']['shape']
         assert len(action_shape) == 1
         action_dim = action_shape[0]
+        # binary action dims (e.g. gripper on/off) need special handling
+        self.binary_action_dims = shape_meta['actions'].get('binary_dims', None)
         obs_shape_meta = shape_meta['obs']
         obs_config = {
             'low_dim': [],
@@ -192,6 +194,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
     def conditional_sample(self,
             condition_data, condition_mask,
             cond=None, generator=None,
+            raw_cumact_offset=None,
             # keyword arguments to scheduler.step
             **kwargs
             ):
@@ -208,13 +211,20 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # set step values
         scheduler.set_timesteps(self.num_inference_steps)
 
-        # initialize cumact as zeros for first DDIM step
+        # initialize cumact
         cumact = None
         if use_cumact:
-            cumact = torch.zeros(
-                condition_data.shape[0], condition_data.shape[1],
-                self.action_dim, device=condition_data.device,
-                dtype=condition_data.dtype)
+            # Start with the episode-level offset normalized via cumact normalizer
+            if raw_cumact_offset is not None:
+                # (B, Da) -> (B, 1, Da) -> broadcast to (B, T, Da)
+                raw_offset_expanded = raw_cumact_offset.unsqueeze(1).expand(
+                    -1, condition_data.shape[1], -1)
+                cumact = self.normalizer['cumact'].normalize(raw_offset_expanded)
+            else:
+                cumact = torch.zeros(
+                    condition_data.shape[0], condition_data.shape[1],
+                    self.action_dim, device=condition_data.device,
+                    dtype=condition_data.dtype)
 
         for t in scheduler.timesteps:
             # 1. apply conditioning
@@ -232,17 +242,35 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             trajectory = step_output.prev_sample
 
             # 4. update cumact from predicted clean trajectory (x0 estimate)
+            #    All computation in RAW action space, then normalize with cumact normalizer.
             if use_cumact:
                 pred_x0 = step_output.pred_original_sample
                 if pred_x0 is not None:
-                    # only use action dims (relevant when obs_as_cond=False)
+                    # Unnormalize predicted actions back to raw space
                     pred_x0_act = pred_x0[..., :self.action_dim]
-                    cs = torch.cumsum(pred_x0_act, dim=1)
-                    # right-shift: cumact[t] = sum(x0[0:t])
-                    cumact = torch.cat([
-                        torch.zeros_like(cs[:, :1, :]),
-                        cs[:, :-1, :]
+                    raw_pred = self.normalizer['actions'].unnormalize(pred_x0_act)
+
+                    # Exclude binary dims
+                    if self.binary_action_dims is not None:
+                        raw_pred = raw_pred.clone()
+                        for dim in self.binary_action_dims:
+                            raw_pred[..., dim] = 0.0
+
+                    # Raw cumsum, right-shifted
+                    raw_cs = torch.cumsum(raw_pred, dim=1)
+                    raw_intra = torch.cat([
+                        torch.zeros_like(raw_cs[:, :1, :]),
+                        raw_cs[:, :-1, :]
                     ], dim=1)
+
+                    # Add episode-level raw offset
+                    if raw_cumact_offset is not None:
+                        raw_full = raw_intra + raw_cumact_offset.unsqueeze(1)
+                    else:
+                        raw_full = raw_intra
+
+                    # Normalize with cumact normalizer
+                    cumact = self.normalizer['cumact'].normalize(raw_full)
 
         # finally make sure conditioning is enforced
         trajectory[condition_mask] = condition_data[condition_mask]
@@ -250,9 +278,12 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor],
+                       episode_cumact: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
+        episode_cumact: (B, Da) cumulative sum of all previously executed actions
+                        in the current episode. None if cumact is not used.
         result: must include "action" key
         """
         assert 'past_action' not in obs_dict # not implemented yet
@@ -264,6 +295,14 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         Da = self.action_dim
         Do = self.obs_feature_dim
         To = self.n_obs_steps
+
+        # normalize episode_cumact if provided
+        # episode_cumact is in RAW action space (sum of executed raw actions).
+        # We pass it as-is to conditional_sample which will handle
+        # the raw-space cumact computation and cumact normalization.
+        raw_cumact_offset = None
+        if episode_cumact is not None and self.use_cumact_encoder:
+            raw_cumact_offset = episode_cumact
 
         # build input
         device = self.device
@@ -297,14 +336,15 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
+            cond_data,
             cond_mask,
             cond=cond,
+            raw_cumact_offset=raw_cumact_offset,
             **self.kwargs)
         
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
-        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        action_pred = self.normalizer['actions'].unnormalize(naction_pred)
 
         # get action
         if self.pred_action_steps_only:
@@ -315,7 +355,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             action = action_pred[:,start:end]
         
         result = {
-            'action': action,
+            'actions': action,
             'action_pred': action_pred
         }
         return result
@@ -346,20 +386,44 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # normalize input
         assert 'valid_mask' not in batch
         nobs = self.normalizer.normalize(batch['obs'])
-        nactions = self.normalizer['action'].normalize(batch['action'])
+        nactions = self.normalizer['actions'].normalize(batch['actions'])
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         To = self.n_obs_steps
 
-        # compute cumulative action history from ground truth (teacher forcing)
-        # cumact[t] = sum(nactions[0:t]), right-shifted so cumact[0] = 0
+        # compute episode-level cumulative action history (teacher forcing)
+        # All cumact computation is done in RAW (unnormalized) action space to
+        # avoid the affine normalizer's non-additive offset issue.  The result
+        # is then normalized with a dedicated cumact normalizer fitted on the
+        # actual cumulative sum distribution.
         cumact = None
         if self.model.cumact_encoder is not None:
-            full_cumact = torch.cumsum(nactions, dim=1)
-            full_cumact = torch.cat([
-                torch.zeros_like(full_cumact[:, :1, :]),
-                full_cumact[:, :-1, :]
-            ], dim=1)
+            raw_actions = batch['actions']               # (B, T, Da)  raw
+            raw_offset  = batch['cumact_offset']         # (B, Da)     raw
+
+            # Prepare raw actions for cumact: zero binary dims + left-pad
+            raw_for_cumact = raw_actions.clone()
+            if self.binary_action_dims is not None:
+                for dim in self.binary_action_dims:
+                    raw_for_cumact[..., dim] = 0.0
+            if 'pad_left' in batch:
+                for i in range(batch_size):
+                    pl = batch['pad_left'][i].item()
+                    if pl > 0:
+                        raw_for_cumact[i, :pl, :] = 0.0
+
+            # Intra-window cumulative sum, right-shifted
+            raw_cs = torch.cumsum(raw_for_cumact, dim=1)
+            raw_intra = torch.cat([
+                torch.zeros_like(raw_cs[:, :1, :]),
+                raw_cs[:, :-1, :]
+            ], dim=1)  # (B, T, Da)
+
+            # Full episode-level raw cumact
+            raw_full_cumact = raw_intra + raw_offset.unsqueeze(1)  # (B, T, Da)
+
+            # Normalize with dedicated cumact normalizer
+            full_cumact = self.normalizer['cumact'].normalize(raw_full_cumact)
 
         # handle different ways of passing observation
         cond = None

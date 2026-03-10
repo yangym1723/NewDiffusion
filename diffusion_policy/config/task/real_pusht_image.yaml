@@ -22,8 +22,9 @@ shape_meta: &shape_meta
     contact_force_z:
       shape: [3]
       type: low_dim
-  action: 
+  actions:
     shape: [10]
+    binary_dims: [9]
 
 env_runner:
   _target_: diffusion_policy.env_runner.isaaclab_image_runner.IsaacLabImageRunner

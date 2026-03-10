@@ -357,23 +357,30 @@ class IsaacLabImageRunner(BaseImageRunner):
         env = self._env
 
         # Temporal ensemble config
-        query_frequency = self.n_action_steps
+        # query_frequency < n_action_steps enables actual chunk overlap and blending.
+        query_frequency = max(1, self.n_action_steps // 2)
         temporal_ensemble_k = 0.01  # exp decay: w[i] = exp(-k * i)
 
         # Determine action_dim from shape_meta
-        action_dim = self.shape_meta['action']['shape'][0]
+        action_dim = self.shape_meta['actions']['shape'][0]
+        binary_action_dims = self.shape_meta['actions'].get('binary_dims', None)
+
+        # Check if policy uses cumact encoder
+        use_cumact = hasattr(policy, 'use_cumact_encoder') and policy.use_cumact_encoder
 
         log_data = {}
         all_rewards = []
         max_rewards = collections.defaultdict(list)
 
-        max_env_steps = self.max_steps * query_frequency
+        max_env_steps = self.max_steps * self.n_action_steps
 
         for ep_idx in range(self.n_test):
             seed = self.test_start_seed + ep_idx
             enable_render = ep_idx < self.n_test_vis
 
-            # Reset env
+            # Reset with deterministic seed for reproducibility
+            torch.manual_seed(seed)
+            np.random.seed(seed)
             isaac_obs, info = env.reset()
             obs = self._extract_obs(isaac_obs, env)
             obs_history = [obs]
@@ -386,6 +393,10 @@ class IsaacLabImageRunner(BaseImageRunner):
 
             # Temporal ensemble state: list of (start_step, action_chunk_np)
             all_action_chunks = []
+
+            # Episode-level cumulative action state
+            batch_size_env = self.n_envs
+            episode_cumact = np.zeros((batch_size_env, action_dim), dtype=np.float32)
 
             pbar = tqdm.tqdm(
                 total=max_env_steps,
@@ -404,9 +415,15 @@ class IsaacLabImageRunner(BaseImageRunner):
                             device=device, dtype=torch.float32)
 
                     with torch.no_grad():
-                        action_dict = policy.predict_action(obs_dict)
+                        if use_cumact:
+                            cumact_tensor = torch.from_numpy(episode_cumact).to(
+                                device=device, dtype=torch.float32)
+                            action_dict = policy.predict_action(obs_dict,
+                                                                episode_cumact=cumact_tensor)
+                        else:
+                            action_dict = policy.predict_action(obs_dict)
 
-                    action_chunk = action_dict["action"].detach().cpu().numpy()
+                    action_chunk = action_dict["actions"].detach().cpu().numpy()
                     all_action_chunks.append((step_count, action_chunk))
 
                 # Temporal ensemble: blend all overlapping chunks
@@ -424,6 +441,14 @@ class IsaacLabImageRunner(BaseImageRunner):
 
                 total_weight = np.maximum(total_weight, 1e-8)
                 blended_action = blended_action / total_weight
+
+                # Discretize binary action dims after temporal ensemble blending
+                # Gripper dim uses {-1, +1} values, so threshold at 0.0
+                if binary_action_dims is not None:
+                    for dim in binary_action_dims:
+                        blended_action[..., dim] = np.where(
+                            blended_action[..., dim] > 0.0, 1.0, -1.0
+                        ).astype(np.float32)
 
                 # Remove fully consumed chunks
                 all_action_chunks = [
@@ -443,6 +468,15 @@ class IsaacLabImageRunner(BaseImageRunner):
                     step_count += 1
                     pbar.update(1)
                     continue
+
+                # Update episode-level cumulative action AFTER successful step
+                # Exclude binary dims from cumact (their cumsum has no physical meaning)
+                if use_cumact:
+                    cumact_update = blended_action.copy()
+                    if binary_action_dims is not None:
+                        for dim in binary_action_dims:
+                            cumact_update[..., dim] = 0.0
+                    episode_cumact += cumact_update
 
                 obs = self._extract_obs(isaac_obs, env)
                 obs_history.append(obs)

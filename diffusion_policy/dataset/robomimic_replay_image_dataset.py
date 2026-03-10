@@ -52,7 +52,18 @@ class RobomimicReplayImageDataset(BaseImageDataset):
 
         replay_buffer = None
         if use_cache:
-            cache_zarr_path = dataset_path + '.zarr.zip'
+            # Include shape_meta hash in cache filename to auto-invalidate
+            # when data format (obs keys, action dims, binary_dims, etc.) changes.
+            meta_for_hash = {
+                'obs': {k: v for k, v in shape_meta['obs'].items()},
+                'actions': shape_meta['actions'],
+                'abs_action': abs_action,
+                'rotation_rep': rotation_rep,
+            }
+            meta_hash = hashlib.md5(
+                json.dumps(meta_for_hash, sort_keys=True, default=str).encode()
+            ).hexdigest()[:8]
+            cache_zarr_path = dataset_path + f'.{meta_hash}.zarr.zip'
             cache_lock_path = cache_zarr_path + '.lock'
             print('Acquiring lock on cache.')
             with FileLock(cache_lock_path):
@@ -124,6 +135,31 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             episode_mask=train_mask,
             key_first_k=key_first_k)
         
+        # Pre-compute per-step episode-level cumulative action sums.
+        # cumact_cumsum[t] = sum of actions from episode start up to (but not
+        # including) step t.  Resets to zero at each episode boundary.
+        # Binary action dims (e.g. gripper on/off) are excluded from cumact
+        # since their cumulative sum has no physical meaning.
+        binary_dims = shape_meta['actions'].get('binary_dims', None)
+        all_actions = replay_buffer['actions'][:]  # (N_total, Da)
+        episode_ends_np = replay_buffer.episode_ends[:]
+        cumact_cumsum = np.zeros_like(all_actions)  # (N_total, Da)
+        prev_end = 0
+        for ep_end in episode_ends_np:
+            ep_actions = all_actions[prev_end:ep_end].copy()  # (ep_len, Da)
+            # Zero out binary dims before cumulative sum
+            if binary_dims is not None:
+                for dim in binary_dims:
+                    ep_actions[:, dim] = 0.0
+            # cumsum gives [a0, a0+a1, ...]; right-shift so offset[0]=0
+            cs = np.cumsum(ep_actions, axis=0)
+            # right-shift: offset[t] = sum(action[0:t])
+            cumact_cumsum[prev_end] = 0.0
+            if ep_end - prev_end > 1:
+                cumact_cumsum[prev_end + 1:ep_end] = cs[:-1]
+            prev_end = ep_end
+
+        self.cumact_cumsum = cumact_cumsum
         self.replay_buffer = replay_buffer
         self.sampler = sampler
         self.shape_meta = shape_meta
@@ -154,7 +190,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         normalizer = LinearNormalizer()
 
         # action
-        stat = array_to_stats(self.replay_buffer['action'])
+        stat = array_to_stats(self.replay_buffer['actions'])
         if self.abs_action:
             if stat['mean'].shape[-1] > 10:
                 # dual arm
@@ -165,9 +201,18 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             if self.use_legacy_normalizer:
                 this_normalizer = normalizer_from_stat(stat)
         else:
-            # already normalized
-            this_normalizer = get_identity_normalizer_from_stat(stat)
-        normalizer['action'] = this_normalizer
+            # Use range normalizer to map all action dims to [-1, 1].
+            # This is important for diffusion model training (consistent scale).
+            # For binary dims (e.g. gripper), min=0/max=1 naturally maps to {-1, +1}.
+            this_normalizer = get_range_normalizer_from_stat(stat)
+        normalizer['actions'] = this_normalizer
+
+        # cumact (episode-level cumulative action sums)
+        # Uses its own normalizer fitted on actual cumulative sum values,
+        # NOT the action normalizer, because cumulative sums have a completely
+        # different value range than individual actions.
+        cumact_stat = array_to_stats(self.cumact_cumsum)
+        normalizer['cumact'] = get_range_normalizer_from_stat(cumact_stat)
 
         # obs
         for key in self.lowdim_keys:
@@ -198,7 +243,7 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
-        return torch.from_numpy(self.replay_buffer['action'])
+        return torch.from_numpy(self.replay_buffer['actions'])
 
     def __len__(self):
         return len(self.sampler)
@@ -232,9 +277,21 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             obs_dict[key] = data[key][T_slice].astype(np.float32)
             del data[key]
 
+        # Episode-level cumulative action offset: the sum of all actions from
+        # episode start up to (but not including) the first step of this window.
+        # Shape: (Da,) — a single vector per sample.
+        buffer_start_idx = self.sampler.indices[idx][0]
+        cumact_offset = self.cumact_cumsum[buffer_start_idx].astype(np.float32)
+
+        # Number of left-padded steps (replicated first action).
+        # Used by compute_loss to zero out padded positions before cumact cumsum.
+        pad_left = int(self.sampler.indices[idx][2])  # sample_start_idx
+
         torch_data = {
             'obs': dict_apply(obs_dict, torch.from_numpy),
-            'action': torch.from_numpy(data['action'].astype(np.float32))
+            'actions': torch.from_numpy(data['actions'].astype(np.float32)),
+            'cumact_offset': torch.from_numpy(cumact_offset),
+            'pad_left': torch.tensor(pad_left, dtype=torch.long)
         }
         return torch_data
 
@@ -296,7 +353,7 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
         prev_end = 0
         for i in range(len(demos)):
             demo = demos[f'demo_{i}']
-            episode_length = demo['action'].shape[0]
+            episode_length = demo['actions'].shape[0]
             episode_end = prev_end + episode_length
             prev_end = episode_end
             episode_ends.append(episode_end)
@@ -306,22 +363,22 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
             dtype=np.int64, compressor=None, overwrite=True)
 
         # save lowdim data
-        for key in tqdm(lowdim_keys + ['action'], desc="Loading lowdim data"):
+        for key in tqdm(lowdim_keys + ['actions'], desc="Loading lowdim data"):
             data_key = 'obs/' + key
-            if key == 'action':
-                data_key = 'action'
+            if key == 'actions':
+                data_key = 'actions'
             this_data = list()
             for i in range(len(demos)):
                 demo = demos[f'demo_{i}']
                 this_data.append(demo[data_key][:].astype(np.float32))
             this_data = np.concatenate(this_data, axis=0)
-            if key == 'action':
+            if key == 'actions':
                 this_data = _convert_actions(
                     raw_actions=this_data,
                     abs_action=abs_action,
                     rotation_transformer=rotation_transformer
                 )
-                assert this_data.shape == (n_steps,) + tuple(shape_meta['action']['shape'])
+                assert this_data.shape == (n_steps,) + tuple(shape_meta['actions']['shape'])
             else:
                 assert this_data.shape == (n_steps,) + tuple(shape_meta['obs'][key]['shape'])
             _ = data_group.array(

@@ -1,9 +1,9 @@
 """
 HDF5 数据预处理脚本
-- data/demo_*/actions -> data/demo_*/action
-- data/demo_*/obs/actions -> data/demo_*/obs/action
+- data/demo_*/actions -> data/demo_*/actions (保持原名)
+- data/demo_*/obs/actions -> data/demo_*/obs/actions (保持原名)
 - data/demo_*/obs/ee_pose 保持原名不变
-- data/demo_*/obs/camera_depth 和 camera_rgb: 将单帧图片扩展到与 action 帧数相同
+- data/demo_*/obs/camera_depth 和 camera_rgb: 将单帧图片扩展到与 actions 帧数相同
 python process_hdf5.py your_data.hdf5
 # 输出: your_data_processed.hdf5
 
@@ -39,13 +39,13 @@ def process_hdf5(input_path, output_path):
             for attr_key, attr_val in demo_in.attrs.items():
                 demo_out.attrs[attr_key] = attr_val
 
-            # --- 处理 actions -> action (demo 级别) ---
+            # --- 处理 actions (demo 级别) ---
             if 'actions' in demo_in:
                 action_data = demo_in['actions'][:]
-                demo_out.create_dataset('action', data=action_data)
+                demo_out.create_dataset('actions', data=action_data)
             elif 'action' in demo_in:
                 action_data = demo_in['action'][:]
-                demo_out.create_dataset('action', data=action_data)
+                demo_out.create_dataset('actions', data=action_data)
             else:
                 raise KeyError(f"{demo_key} 中找不到 'actions' 或 'action' 数据项")
 
@@ -60,9 +60,9 @@ def process_hdf5(input_path, output_path):
             for obs_key in obs_in.keys():
                 src_data = obs_in[obs_key][:]
 
-                # 重命名: actions -> action
+                # actions 保持原名
                 if obs_key == 'actions':
-                    out_key = 'action'
+                    out_key = 'actions'
                 # ee_pose 保持原名不变
                 elif obs_key == 'ee_pose':
                     out_key = 'ee_pose'

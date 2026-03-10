@@ -32,6 +32,7 @@ parser.add_argument("--num_envs", type=int, default=1, help="Number of parallel 
 parser.add_argument("--n_test", type=int, default=10, help="Number of test episodes")
 parser.add_argument("--n_test_vis", type=int, default=3, help="Number of test episodes to record video")
 parser.add_argument("--max_steps", type=int, default=750, help="Max action chunks per episode")
+parser.add_argument("--test_start_seed", type=int, default=10000, help="Starting seed for test episodes")
 
 # Add IsaacLab AppLauncher arguments
 from isaaclab.app import AppLauncher
@@ -48,6 +49,7 @@ simulation_app = app_launcher.app
 # STEP 2: Now safe to import everything else
 # ============================================================
 import os
+import sys
 import pathlib
 import json
 import collections
@@ -286,21 +288,29 @@ def main():
 
     log_data = {}
     max_rewards = collections.defaultdict(list)
-    test_start_seed = 10000
+    test_start_seed = args.test_start_seed
 
     # Temporal ensemble parameters
     # Re-query the policy every `query_frequency` env steps.
     # All overlapping action chunks are blended with exponential weights.
-    query_frequency = n_action_steps  # query every n_action_steps (same timing)
+    # To enable actual temporal ensemble blending, query_frequency must be
+    # smaller than n_action_steps so that consecutive chunks overlap.
+    query_frequency = max(1, n_action_steps // 2)
     temporal_ensemble_k = 0.01  # exponential weight decay: w[i] = exp(-k * i)
 
-    action_dim = shape_meta['action']['shape'][0]
+    action_dim = shape_meta['actions']['shape'][0]
+    binary_action_dims = shape_meta['actions'].get('binary_dims', None)
+
+    # Check if policy uses cumact encoder
+    use_cumact = hasattr(policy, 'use_cumact_encoder') and policy.use_cumact_encoder
 
     for ep_idx in range(n_test):
         seed = test_start_seed + ep_idx
         enable_render = ep_idx < n_test_vis
 
-        # Reset
+        # Reset with deterministic seed for reproducibility
+        torch.manual_seed(seed)
+        np.random.seed(seed)
         isaac_obs, info = env.reset()
         obs = extract_obs(isaac_obs, env, image_shape, depth_shape)
         obs_history = [obs]
@@ -315,14 +325,17 @@ def main():
         # Each entry: (start_step, action_chunk) where action_chunk is (B, Ta, Da)
         all_action_chunks = []
 
+        # Episode-level cumulative action state (running sum of executed actions)
+        episode_cumact = np.zeros((num_envs, action_dim), dtype=np.float32)
+
         pbar = tqdm.tqdm(
-            total=max_steps * query_frequency,
+            total=max_steps * n_action_steps,
             desc=f"Eval ThreeFingers ep {ep_idx+1}/{n_test}",
             leave=False,
             mininterval=5.0,
         )
 
-        while not done and step_count < max_steps * query_frequency:
+        while not done and step_count < max_steps * n_action_steps:
             # Query policy when needed (every query_frequency steps, or at step 0)
             if step_count % query_frequency == 0:
                 # Stack observations
@@ -333,8 +346,15 @@ def main():
 
                 # Policy inference
                 with torch.no_grad():
-                    action_dict = policy.predict_action(obs_dict)
-                action_chunk = action_dict["action"].detach().cpu().numpy()  # (B, Ta, Da)
+                    # Pass episode-level cumulative action if cumact is enabled
+                    if use_cumact:
+                        cumact_tensor = torch.from_numpy(episode_cumact).to(
+                            device=device, dtype=torch.float32)
+                        action_dict = policy.predict_action(obs_dict,
+                                                            episode_cumact=cumact_tensor)
+                    else:
+                        action_dict = policy.predict_action(obs_dict)
+                action_chunk = action_dict["actions"].detach().cpu().numpy()  # (B, Ta, Da)
                 all_action_chunks.append((step_count, action_chunk))
                 chunk_count += 1
 
@@ -356,6 +376,14 @@ def main():
             total_weight = np.maximum(total_weight, 1e-8)
             blended_action = blended_action / total_weight
 
+            # Discretize binary action dims after temporal ensemble blending
+            # Gripper dim uses {-1, +1} values, so threshold at 0.0
+            if binary_action_dims is not None:
+                for dim in binary_action_dims:
+                    blended_action[..., dim] = np.where(
+                        blended_action[..., dim] > 0.0, 1.0, -1.0
+                    ).astype(np.float32)
+
             # Remove chunks that are fully consumed (no longer overlap with current step)
             all_action_chunks = [
                 (s, c) for s, c in all_action_chunks
@@ -374,6 +402,15 @@ def main():
                 step_count += 1
                 pbar.update(1)
                 continue
+
+            # Update episode-level cumulative action AFTER successful step
+            # Exclude binary dims from cumact (their cumsum has no physical meaning)
+            if use_cumact:
+                cumact_update = blended_action.copy()
+                if binary_action_dims is not None:
+                    for dim in binary_action_dims:
+                        cumact_update[..., dim] = 0.0
+                episode_cumact += cumact_update
 
             obs = extract_obs(isaac_obs, env, image_shape, depth_shape)
             obs_history.append(obs)
