@@ -397,6 +397,8 @@ class IsaacLabImageRunner(BaseImageRunner):
             # Episode-level cumulative action state
             batch_size_env = self.n_envs
             episode_cumact = np.zeros((batch_size_env, action_dim), dtype=np.float32)
+            consecutive_ik_failures = 0
+            max_consecutive_ik_failures = 50
 
             pbar = tqdm.tqdm(
                 total=max_env_steps,
@@ -464,10 +466,18 @@ class IsaacLabImageRunner(BaseImageRunner):
                 try:
                     isaac_obs, reward, terminated, truncated, info = env.step(action_tensor)
                 except torch._C._LinAlgError as e:
-                    print(f"  [WARN] IK singularity at step {step_count}: {e}. Skipping.")
+                    consecutive_ik_failures += 1
+                    if consecutive_ik_failures >= max_consecutive_ik_failures:
+                        print(f"  [WARN] {max_consecutive_ik_failures} consecutive IK singularities at step {step_count}. Terminating episode.")
+                        done = True
+                    elif consecutive_ik_failures == 1:
+                        print(f"  [WARN] IK singularity at step {step_count}: {e}. Skipping.")
                     step_count += 1
                     pbar.update(1)
                     continue
+
+                # Reset consecutive IK failure counter on successful step
+                consecutive_ik_failures = 0
 
                 # Update episode-level cumulative action AFTER successful step
                 # Exclude binary dims from cumact (their cumsum has no physical meaning)
