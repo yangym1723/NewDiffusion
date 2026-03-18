@@ -54,7 +54,11 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         assert len(action_shape) == 1
         action_dim = action_shape[0]
         # binary action dims (e.g. gripper on/off) need special handling
-        self.binary_action_dims = shape_meta['actions'].get('binary_dims', None)
+        binary_action_dims = shape_meta['actions'].get('binary_dims', None)
+        persistent_action_dims = shape_meta['actions'].get('persistent_dims', None)
+        self.binary_action_dims = sorted(binary_action_dims) if binary_action_dims is not None else []
+        self.persistent_action_dims = sorted(persistent_action_dims) if persistent_action_dims is not None else []
+        self.non_cumact_action_dims = sorted(set(self.binary_action_dims + self.persistent_action_dims))
         obs_shape_meta = shape_meta['obs']
         obs_config = {
             'low_dim': [],
@@ -189,6 +193,32 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         if num_inference_steps is None:
             num_inference_steps = noise_scheduler.config.num_train_timesteps
         self.num_inference_steps = num_inference_steps
+
+    def _zero_non_cumact_action_dims(self, action_tensor: torch.Tensor) -> torch.Tensor:
+        if len(self.non_cumact_action_dims) == 0:
+            return action_tensor
+        action_tensor = action_tensor.clone()
+        for dim in self.non_cumact_action_dims:
+            action_tensor[..., dim] = 0.0
+        return action_tensor
+
+    def _apply_persistent_action_dims(self, action_tensor: torch.Tensor,
+                                      persistent_action: torch.Tensor = None):
+        if len(self.persistent_action_dims) == 0:
+            return action_tensor, None
+
+        if persistent_action is None:
+            ref_idx = 0 if self.pred_action_steps_only else min(
+                self.n_obs_steps - 1, action_tensor.shape[1] - 1)
+            persistent_action = action_tensor[:, ref_idx, self.persistent_action_dims]
+        else:
+            persistent_action = persistent_action.to(
+                device=action_tensor.device, dtype=action_tensor.dtype)
+
+        action_tensor = action_tensor.clone()
+        for value_idx, dim in enumerate(self.persistent_action_dims):
+            action_tensor[..., dim] = persistent_action[:, value_idx].unsqueeze(1)
+        return action_tensor, persistent_action
     
     # ========= inference  ============
     def conditional_sample(self,
@@ -254,11 +284,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
                     pred_x0_act = pred_x0[..., :self.action_dim]
                     raw_pred = self.normalizer['actions'].unnormalize(pred_x0_act)
 
-                    # Exclude binary dims
-                    if self.binary_action_dims is not None:
-                        raw_pred = raw_pred.clone()
-                        for dim in self.binary_action_dims:
-                            raw_pred[..., dim] = 0.0
+                    # Exclude non-cumulative dims
+                    raw_pred = self._zero_non_cumact_action_dims(raw_pred)
 
                     # Raw cumsum, right-shifted
                     raw_cs = torch.cumsum(raw_pred, dim=1)
@@ -281,9 +308,9 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
 
         return trajectory
 
-
     def predict_action(self, obs_dict: Dict[str, torch.Tensor],
-                       episode_cumact: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+                       episode_cumact: torch.Tensor = None,
+                       persistent_action: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         episode_cumact: (B, Da) cumulative sum of all previously executed actions
@@ -349,6 +376,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # unnormalize prediction
         naction_pred = nsample[...,:Da]
         action_pred = self.normalizer['actions'].unnormalize(naction_pred)
+        action_pred, persistent_action = self._apply_persistent_action_dims(
+            action_pred, persistent_action=persistent_action)
 
         # get action
         if self.pred_action_steps_only:
@@ -362,6 +391,8 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
             'actions': action,
             'action_pred': action_pred
         }
+        if persistent_action is not None:
+            result['persistent_action'] = persistent_action
         return result
 
     # ========= training  ============
@@ -389,8 +420,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
     def compute_loss(self, batch):
         # normalize input
         assert 'valid_mask' not in batch
+        raw_actions = batch['actions']
+        raw_actions, _ = self._apply_persistent_action_dims(raw_actions)
         nobs = self.normalizer.normalize(batch['obs'])
-        nactions = self.normalizer['actions'].normalize(batch['actions'])
+        nactions = self.normalizer['actions'].normalize(raw_actions)
         batch_size = nactions.shape[0]
         horizon = nactions.shape[1]
         To = self.n_obs_steps
@@ -402,14 +435,10 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         # actual cumulative sum distribution.
         cumact = None
         if self.model.cumact_encoder is not None:
-            raw_actions = batch['actions']               # (B, T, Da)  raw
             raw_offset  = batch['cumact_offset']         # (B, Da)     raw
 
-            # Prepare raw actions for cumact: zero binary dims + padded positions
-            raw_for_cumact = raw_actions.clone()
-            if self.binary_action_dims is not None:
-                for dim in self.binary_action_dims:
-                    raw_for_cumact[..., dim] = 0.0
+            # Prepare raw actions for cumact: zero non-cumulative dims + padded positions
+            raw_for_cumact = self._zero_non_cumact_action_dims(raw_actions)
             if 'pad_left' in batch:
                 for i in range(batch_size):
                     pl = batch['pad_left'][i].item()

@@ -364,6 +364,13 @@ class IsaacLabImageRunner(BaseImageRunner):
         # Determine action_dim from shape_meta
         action_dim = self.shape_meta['actions']['shape'][0]
         binary_action_dims = self.shape_meta['actions'].get('binary_dims', None)
+        persistent_action_dims = self.shape_meta['actions'].get('persistent_dims', None)
+        non_cumact_action_dims = list()
+        if binary_action_dims is not None:
+            non_cumact_action_dims.extend(binary_action_dims)
+        if persistent_action_dims is not None:
+            non_cumact_action_dims.extend(persistent_action_dims)
+        non_cumact_action_dims = sorted(set(non_cumact_action_dims))
 
         # Check if policy uses cumact encoder
         use_cumact = hasattr(policy, 'use_cumact_encoder') and policy.use_cumact_encoder
@@ -382,6 +389,7 @@ class IsaacLabImageRunner(BaseImageRunner):
             torch.manual_seed(seed)
             np.random.seed(seed)
             isaac_obs, info = env.reset(seed=seed)
+            policy.reset()
             obs = self._extract_obs(isaac_obs, env)
             obs_history = [obs]
 
@@ -397,6 +405,7 @@ class IsaacLabImageRunner(BaseImageRunner):
             # Episode-level cumulative action state
             batch_size_env = self.n_envs
             episode_cumact = np.zeros((batch_size_env, action_dim), dtype=np.float32)
+            episode_persistent_action = None
             consecutive_ik_failures = 0
             max_consecutive_ik_failures = 50
 
@@ -417,13 +426,24 @@ class IsaacLabImageRunner(BaseImageRunner):
                             device=device, dtype=torch.float32)
 
                     with torch.no_grad():
+                        persistent_action_tensor = None
+                        if episode_persistent_action is not None:
+                            persistent_action_tensor = torch.from_numpy(
+                                episode_persistent_action).to(
+                                    device=device, dtype=torch.float32)
                         if use_cumact:
                             cumact_tensor = torch.from_numpy(episode_cumact).to(
                                 device=device, dtype=torch.float32)
                             action_dict = policy.predict_action(obs_dict,
-                                                                episode_cumact=cumact_tensor)
+                                                                episode_cumact=cumact_tensor,
+                                                                persistent_action=persistent_action_tensor)
                         else:
-                            action_dict = policy.predict_action(obs_dict)
+                            action_dict = policy.predict_action(
+                                obs_dict, persistent_action=persistent_action_tensor)
+
+                    if 'persistent_action' in action_dict:
+                        episode_persistent_action = action_dict[
+                            'persistent_action'].detach().cpu().numpy()
 
                     action_chunk = action_dict["actions"].detach().cpu().numpy()
                     all_action_chunks.append((step_count, action_chunk))
@@ -480,11 +500,11 @@ class IsaacLabImageRunner(BaseImageRunner):
                 consecutive_ik_failures = 0
 
                 # Update episode-level cumulative action AFTER successful step
-                # Exclude binary dims from cumact (their cumsum has no physical meaning)
+                # Exclude non-cumulative dims from cumact.
                 if use_cumact:
                     cumact_update = blended_action.copy()
-                    if binary_action_dims is not None:
-                        for dim in binary_action_dims:
+                    if len(non_cumact_action_dims) > 0:
+                        for dim in non_cumact_action_dims:
                             cumact_update[..., dim] = 0.0
                     episode_cumact += cumact_update
 

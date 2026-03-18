@@ -2,7 +2,7 @@ name: real_image
 
 image_shape: &image_shape [3, 240, 320]
 depth_shape: &depth_shape [1, 240, 320]
-dataset_path: data/dataset_H480W640_process.hdf5
+dataset_path: data/dataset_H480W640.hdf5
 
 shape_meta: &shape_meta
   # acceptable types: rgb, low_dim, depth
@@ -24,6 +24,7 @@ shape_meta: &shape_meta
       type: low_dim
   actions:
     shape: [10]
+    persistent_dims: [7, 8]
     binary_dims: [9]
 
 env_runner:
@@ -58,6 +59,8 @@ dataset:
   rotation_rep: 'rotation_6d'
   use_legacy_normalizer: False
   use_cache: True
+  load_image_obs_from_hdf5: True
+  repeat_single_frame_image_obs: True
+  preload_single_frame_image_obs: True
   seed: 42
   val_ratio: 0.02
-

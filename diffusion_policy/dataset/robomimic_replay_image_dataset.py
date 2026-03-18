@@ -44,11 +44,20 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             rotation_rep='rotation_6d', # ignored when abs_action=False
             use_legacy_normalizer=False,
             use_cache=False,
+            load_image_obs_from_hdf5=False,
+            repeat_single_frame_image_obs=False,
+            preload_single_frame_image_obs=True,
             seed=42,
             val_ratio=0.0
         ):
         rotation_transformer = RotationTransformer(
             from_rep='axis_angle', to_rep=rotation_rep)
+
+        if not os.path.isfile(dataset_path):
+            raise FileNotFoundError(
+                f"Dataset file not found: {dataset_path}. "
+                "Please set task.dataset_path to the correct HDF5 file."
+            )
 
         replay_buffer = None
         if use_cache:
@@ -59,6 +68,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 'actions': shape_meta['actions'],
                 'abs_action': abs_action,
                 'rotation_rep': rotation_rep,
+                'load_image_obs_from_hdf5': load_image_obs_from_hdf5,
+                'repeat_single_frame_image_obs': repeat_single_frame_image_obs,
+                'preload_single_frame_image_obs': preload_single_frame_image_obs,
             }
             meta_hash = hashlib.md5(
                 json.dumps(meta_for_hash, sort_keys=True, default=str).encode()
@@ -77,14 +89,19 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                             shape_meta=shape_meta, 
                             dataset_path=dataset_path, 
                             abs_action=abs_action, 
-                            rotation_transformer=rotation_transformer)
+                            rotation_transformer=rotation_transformer,
+                            store_image_obs=not load_image_obs_from_hdf5,
+                            repeat_single_frame_image_obs=repeat_single_frame_image_obs)
                         print('Saving cache to disk.')
                         with zarr.ZipStore(cache_zarr_path) as zip_store:
                             replay_buffer.save_to_store(
                                 store=zip_store
                             )
                     except Exception as e:
-                        shutil.rmtree(cache_zarr_path)
+                        if os.path.isdir(cache_zarr_path):
+                            shutil.rmtree(cache_zarr_path)
+                        elif os.path.exists(cache_zarr_path):
+                            os.remove(cache_zarr_path)
                         raise e
                 else:
                     print('Loading cached ReplayBuffer from Disk.')
@@ -98,7 +115,9 @@ class RobomimicReplayImageDataset(BaseImageDataset):
                 shape_meta=shape_meta, 
                 dataset_path=dataset_path, 
                 abs_action=abs_action, 
-                rotation_transformer=rotation_transformer)
+                rotation_transformer=rotation_transformer,
+                store_image_obs=not load_image_obs_from_hdf5,
+                repeat_single_frame_image_obs=repeat_single_frame_image_obs)
 
         rgb_keys = list()
         lowdim_keys = list()
@@ -141,15 +160,22 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         # Binary action dims (e.g. gripper on/off) are excluded from cumact
         # since their cumulative sum has no physical meaning.
         binary_dims = shape_meta['actions'].get('binary_dims', None)
+        persistent_dims = shape_meta['actions'].get('persistent_dims', None)
+        non_cumact_dims = list()
+        if binary_dims is not None:
+            non_cumact_dims.extend(binary_dims)
+        if persistent_dims is not None:
+            non_cumact_dims.extend(persistent_dims)
+        non_cumact_dims = sorted(set(non_cumact_dims))
         all_actions = replay_buffer['actions'][:]  # (N_total, Da)
         episode_ends_np = replay_buffer.episode_ends[:]
         cumact_cumsum = np.zeros_like(all_actions)  # (N_total, Da)
         prev_end = 0
         for ep_end in episode_ends_np:
             ep_actions = all_actions[prev_end:ep_end].copy()  # (ep_len, Da)
-            # Zero out binary dims before cumulative sum
-            if binary_dims is not None:
-                for dim in binary_dims:
+            # Zero out non-cumulative dims before cumulative sum.
+            if len(non_cumact_dims) > 0:
+                for dim in non_cumact_dims:
                     ep_actions[:, dim] = 0.0
             # cumsum gives [a0, a0+a1, ...]; right-shift so offset[0]=0
             cs = np.cumsum(ep_actions, axis=0)
@@ -173,6 +199,25 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         self.pad_before = pad_before
         self.pad_after = pad_after
         self.use_legacy_normalizer = use_legacy_normalizer
+        self.dataset_path = dataset_path
+        self.load_image_obs_from_hdf5 = load_image_obs_from_hdf5
+        self.repeat_single_frame_image_obs = repeat_single_frame_image_obs
+        self.preload_single_frame_image_obs = preload_single_frame_image_obs
+        self.episode_ends = replay_buffer.episode_ends[:].astype(np.int64)
+        self.episode_starts = np.concatenate([
+            np.zeros((1,), dtype=np.int64),
+            self.episode_ends[:-1]
+        ]) if len(self.episode_ends) > 0 else np.zeros((0,), dtype=np.int64)
+        self.episode_lengths = self.episode_ends - self.episode_starts
+        self._hdf5_file = None
+        self._image_obs_stats = None
+        self._single_frame_image_cache = {
+            key: dict() for key in (self.rgb_keys + self.depth_keys)
+        }
+        if self.load_image_obs_from_hdf5 \
+                and self.repeat_single_frame_image_obs \
+                and self.preload_single_frame_image_obs:
+            self._preload_single_frame_image_obs()
 
     def get_validation_dataset(self):
         val_set = copy.copy(self)
@@ -184,7 +229,232 @@ class RobomimicReplayImageDataset(BaseImageDataset):
             episode_mask=~self.train_mask
             )
         val_set.train_mask = ~self.train_mask
+        val_set._hdf5_file = None
         return val_set
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['_hdf5_file'] = None
+        return state
+
+    def __del__(self):
+        hdf5_file = getattr(self, '_hdf5_file', None)
+        if hdf5_file is not None:
+            try:
+                hdf5_file.close()
+            except Exception:
+                pass
+
+    def _get_hdf5_file(self):
+        if self._hdf5_file is None:
+            self._hdf5_file = h5py.File(self.dataset_path, 'r')
+        return self._hdf5_file
+
+    def _get_obs_steps(self):
+        if self.n_obs_steps is None:
+            return self.sampler.sequence_length
+        return min(self.n_obs_steps, self.sampler.sequence_length)
+
+    def _preload_single_frame_image_obs(self):
+        image_keys = self.rgb_keys + self.depth_keys
+        if len(image_keys) == 0:
+            return
+
+        with h5py.File(self.dataset_path, 'r') as file:
+            demos = file['data']
+            for episode_idx in range(len(self.episode_ends)):
+                demo = demos[f'demo_{episode_idx}']
+                episode_length = int(demo['actions'].shape[0])
+                for key in image_keys:
+                    hdf5_arr = demo['obs'][key]
+                    n_frames = int(hdf5_arr.shape[0])
+                    if n_frames == 1:
+                        obs_type = self.shape_meta['obs'][key].get('type', 'low_dim')
+                        target_shape = tuple(self.shape_meta['obs'][key]['shape'])
+                        frame = self._prepare_image_frame(
+                            hdf5_arr[0], target_shape=target_shape, obs_type=obs_type)
+                        self._single_frame_image_cache[key][episode_idx] = frame
+                    elif n_frames != episode_length:
+                        raise ValueError(
+                            f"data/demo_{episode_idx}/obs/{key} has {n_frames} frames, "
+                            f"but actions has {episode_length}. "
+                            "Expected either 1 frame or one frame per action step."
+                        )
+
+    def _get_sequence_meta(self, idx: int):
+        buffer_start_idx, buffer_end_idx, sample_start_idx, sample_end_idx = \
+            self.sampler.indices[idx]
+        episode_idx = int(np.searchsorted(
+            self.episode_ends, buffer_start_idx, side='right'))
+        episode_start = int(self.episode_starts[episode_idx])
+        return {
+            'episode_idx': episode_idx,
+            'buffer_start_idx': int(buffer_start_idx),
+            'buffer_end_idx': int(buffer_end_idx),
+            'sample_start_idx': int(sample_start_idx),
+            'sample_end_idx': int(sample_end_idx),
+            'episode_start': episode_start,
+            'episode_length': int(self.episode_lengths[episode_idx]),
+            'n_data': int(buffer_end_idx - buffer_start_idx),
+            'episode_local_start': int(buffer_start_idx - episode_start),
+        }
+
+    def _get_source_indices(self, sequence_meta: dict, target_steps: int):
+        source_indices = np.empty((target_steps,), dtype=np.int64)
+        first_idx = sequence_meta['episode_local_start']
+        last_idx = first_idx + sequence_meta['n_data'] - 1
+        sample_start_idx = sequence_meta['sample_start_idx']
+        sample_end_idx = sequence_meta['sample_end_idx']
+        for step_idx in range(target_steps):
+            if step_idx < sample_start_idx:
+                source_indices[step_idx] = first_idx
+            elif step_idx >= sample_end_idx:
+                source_indices[step_idx] = last_idx
+            else:
+                source_indices[step_idx] = first_idx + (step_idx - sample_start_idx)
+        return source_indices
+
+    def _prepare_image_frame(self, frame, target_shape, obs_type: str):
+        c, h, w = target_shape
+        interpolation = cv2.INTER_AREA
+        if obs_type == 'depth':
+            interpolation = cv2.INTER_NEAREST
+            frame = frame.astype(np.float32, copy=False)
+
+        if frame.ndim == 2:
+            frame = frame[:, :, np.newaxis]
+
+        src_h, src_w = frame.shape[:2]
+        if src_h != h or src_w != w:
+            if frame.shape[-1] == 1:
+                frame = cv2.resize(frame[:, :, 0], (w, h), interpolation=interpolation)
+                frame = frame[:, :, np.newaxis]
+            else:
+                frame = cv2.resize(frame, (w, h), interpolation=interpolation)
+
+        if frame.ndim == 2:
+            frame = frame[:, :, np.newaxis]
+        return frame
+
+    def _load_image_sequence_from_hdf5(self, idx: int, key: str, obs_type: str):
+        sequence_meta = self._get_sequence_meta(idx)
+        target_steps = self._get_obs_steps()
+        source_indices = self._get_source_indices(sequence_meta, target_steps)
+        target_shape = tuple(self.shape_meta['obs'][key]['shape'])
+
+        demo = self._get_hdf5_file()['data'][f"demo_{sequence_meta['episode_idx']}"]
+        hdf5_arr = demo['obs'][key]
+        n_frames = int(hdf5_arr.shape[0])
+
+        if n_frames == 1:
+            if not self.repeat_single_frame_image_obs:
+                raise ValueError(
+                    f"data/demo_{sequence_meta['episode_idx']}/obs/{key} only has 1 frame. "
+                    "Set repeat_single_frame_image_obs=True to reuse it during training."
+                )
+            cached_frame = self._single_frame_image_cache[key].get(
+                sequence_meta['episode_idx'])
+            if cached_frame is None:
+                cached_frame = self._prepare_image_frame(
+                    hdf5_arr[0], target_shape=target_shape, obs_type=obs_type)
+                self._single_frame_image_cache[key][sequence_meta['episode_idx']] = cached_frame
+            return np.repeat(cached_frame[np.newaxis, ...], target_steps, axis=0)
+        elif np.max(source_indices) >= n_frames:
+            raise ValueError(
+                f"data/demo_{sequence_meta['episode_idx']}/obs/{key} has {n_frames} frames, "
+                f"but training needs index {int(np.max(source_indices))}. "
+                "Expected either 1 frame or one frame per action step."
+            )
+
+        frames = [
+            self._prepare_image_frame(
+                hdf5_arr[int(src_idx)], target_shape=target_shape, obs_type=obs_type)
+            for src_idx in source_indices
+        ]
+        return np.stack(frames, axis=0)
+
+    def _get_image_obs_stats_from_hdf5(self):
+        if self._image_obs_stats is not None:
+            return self._image_obs_stats
+
+        stats = dict()
+        if len(self.depth_keys) == 0:
+            self._image_obs_stats = stats
+            return stats
+
+        with h5py.File(self.dataset_path, 'r') as file:
+            demos = file['data']
+            for key in self.depth_keys:
+                target_shape = tuple(self.shape_meta['obs'][key]['shape'])
+                min_arr = None
+                max_arr = None
+                sum_arr = None
+                sq_sum_arr = None
+                count = 0
+
+                for episode_idx in range(len(self.episode_ends)):
+                    demo = demos[f'demo_{episode_idx}']
+                    hdf5_arr = demo['obs'][key]
+                    episode_length = int(demo['actions'].shape[0])
+                    n_frames = int(hdf5_arr.shape[0])
+
+                    if n_frames == 1:
+                        if not self.repeat_single_frame_image_obs:
+                            raise ValueError(
+                                f"data/demo_{episode_idx}/obs/{key} only has 1 frame. "
+                                "Set repeat_single_frame_image_obs=True to reuse it during training."
+                            )
+                        frame = self._prepare_image_frame(
+                            hdf5_arr[0], target_shape=target_shape, obs_type='depth')
+                        weight = episode_length
+                        frame64 = frame.astype(np.float64)
+                        if min_arr is None:
+                            min_arr = frame.copy()
+                            max_arr = frame.copy()
+                            sum_arr = frame64 * weight
+                            sq_sum_arr = np.square(frame64) * weight
+                        else:
+                            min_arr = np.minimum(min_arr, frame)
+                            max_arr = np.maximum(max_arr, frame)
+                            sum_arr += frame64 * weight
+                            sq_sum_arr += np.square(frame64) * weight
+                        count += weight
+                        continue
+
+                    if n_frames != episode_length:
+                        raise ValueError(
+                            f"data/demo_{episode_idx}/obs/{key} has {n_frames} frames, "
+                            f"but actions has {episode_length}. "
+                            "Expected either 1 frame or one frame per action step."
+                        )
+
+                    for frame_idx in range(n_frames):
+                        frame = self._prepare_image_frame(
+                            hdf5_arr[frame_idx], target_shape=target_shape, obs_type='depth')
+                        frame64 = frame.astype(np.float64)
+                        if min_arr is None:
+                            min_arr = frame.copy()
+                            max_arr = frame.copy()
+                            sum_arr = frame64
+                            sq_sum_arr = np.square(frame64)
+                        else:
+                            min_arr = np.minimum(min_arr, frame)
+                            max_arr = np.maximum(max_arr, frame)
+                            sum_arr += frame64
+                            sq_sum_arr += np.square(frame64)
+                        count += 1
+
+                mean_arr = (sum_arr / count).astype(np.float32)
+                var_arr = np.maximum(sq_sum_arr / count - np.square(mean_arr.astype(np.float64)), 0.0)
+                stats[key] = {
+                    'min': min_arr.astype(np.float32),
+                    'max': max_arr.astype(np.float32),
+                    'mean': mean_arr,
+                    'std': np.sqrt(var_arr).astype(np.float32)
+                }
+
+        self._image_obs_stats = stats
+        return stats
 
     def get_normalizer(self, **kwargs) -> LinearNormalizer:
         normalizer = LinearNormalizer()
@@ -237,7 +507,10 @@ class RobomimicReplayImageDataset(BaseImageDataset):
 
         # depth
         for key in self.depth_keys:
-            stat = array_to_stats(self.replay_buffer[key])
+            if key in self.replay_buffer:
+                stat = array_to_stats(self.replay_buffer[key])
+            else:
+                stat = self._get_image_obs_stats_from_hdf5()[key]
             normalizer[key] = get_range_normalizer_from_stat(stat)
 
         return normalizer
@@ -256,23 +529,32 @@ class RobomimicReplayImageDataset(BaseImageDataset):
         # since the rest will be discarded anyway.
         # when self.n_obs_steps is None
         # this slice does nothing (takes all)
-        T_slice = slice(self.n_obs_steps)
+        obs_steps = self._get_obs_steps()
+        T_slice = slice(obs_steps)
 
         obs_dict = dict()
         for key in self.rgb_keys:
+            if self.load_image_obs_from_hdf5:
+                image_data = self._load_image_sequence_from_hdf5(
+                    idx, key=key, obs_type='rgb')
+            else:
+                image_data = data[key][T_slice]
+                del data[key]
             # move channel last to channel first
             # T,H,W,C
             # convert uint8 image to float32
-            obs_dict[key] = np.moveaxis(data[key][T_slice],-1,1
-                ).astype(np.float32) / 255.
+            obs_dict[key] = np.moveaxis(image_data, -1, 1).astype(np.float32) / 255.
             # T,C,H,W
-            del data[key]
         for key in self.depth_keys:
+            if self.load_image_obs_from_hdf5:
+                depth_data = self._load_image_sequence_from_hdf5(
+                    idx, key=key, obs_type='depth')
+            else:
+                depth_data = data[key][T_slice]
+                del data[key]
             # move channel last to channel first
             # T,H,W,C -> T,C,H,W, already float32
-            obs_dict[key] = np.moveaxis(data[key][T_slice], -1, 1
-                ).astype(np.float32)
-            del data[key]
+            obs_dict[key] = np.moveaxis(depth_data, -1, 1).astype(np.float32)
         for key in self.lowdim_keys:
             obs_dict[key] = data[key][T_slice].astype(np.float32)
             del data[key]
@@ -325,7 +607,8 @@ def _convert_actions(raw_actions, abs_action, rotation_transformer):
 
 
 def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, rotation_transformer, 
-        n_workers=None, max_inflight_tasks=None):
+        n_workers=None, max_inflight_tasks=None, store_image_obs=True,
+        repeat_single_frame_image_obs=False):
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
     if max_inflight_tasks is None:
@@ -409,84 +692,110 @@ def _convert_robomimic_to_replay(store, shape_meta, dataset_path, abs_action, ro
             except Exception as e:
                 return False
         
-        with tqdm(total=n_steps*len(rgb_keys), desc="Loading image data", mininterval=1.0) as pbar:
-            # one chunk per thread, therefore no synchronization needed
-            with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-                futures = set()
-                for key in rgb_keys:
-                    data_key = 'obs/' + key
-                    shape = tuple(shape_meta['obs'][key]['shape'])
-                    c,h,w = shape
-                    this_compressor = Jpeg2k(level=50)
-                    img_arr = data_group.require_dataset(
-                        name=key,
-                        shape=(n_steps,h,w,c),
-                        chunks=(1,h,w,c),
-                        compressor=this_compressor,
-                        dtype=np.uint8
-                    )
+        if store_image_obs:
+            with tqdm(total=n_steps*len(rgb_keys), desc="Loading image data", mininterval=1.0) as pbar:
+                # one chunk per thread, therefore no synchronization needed
+                with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+                    futures = set()
+                    for key in rgb_keys:
+                        data_key = 'obs/' + key
+                        shape = tuple(shape_meta['obs'][key]['shape'])
+                        c,h,w = shape
+                        this_compressor = Jpeg2k(level=50)
+                        img_arr = data_group.require_dataset(
+                            name=key,
+                            shape=(n_steps,h,w,c),
+                            chunks=(1,h,w,c),
+                            compressor=this_compressor,
+                            dtype=np.uint8
+                        )
+                        for episode_idx in range(len(demos)):
+                            demo = demos[f'demo_{episode_idx}']
+                            hdf5_arr = demo['obs'][key]
+                            episode_length = episode_ends[episode_idx] - episode_starts[episode_idx]
+                            n_frames = hdf5_arr.shape[0]
+                            if n_frames == 1 and repeat_single_frame_image_obs:
+                                source_indices = [0] * episode_length
+                            elif n_frames == episode_length:
+                                source_indices = range(episode_length)
+                            else:
+                                raise ValueError(
+                                    f"data/demo_{episode_idx}/obs/{key} has {n_frames} frames, "
+                                    f"but actions has {episode_length}. "
+                                    "Expected either 1 frame or one frame per action step."
+                                )
+                            for step_idx, hdf5_idx in enumerate(source_indices):
+                                if len(futures) >= max_inflight_tasks:
+                                    # limit number of inflight tasks
+                                    completed, futures = concurrent.futures.wait(futures, 
+                                        return_when=concurrent.futures.FIRST_COMPLETED)
+                                    for f in completed:
+                                        if not f.result():
+                                            raise RuntimeError('Failed to encode image!')
+                                    pbar.update(len(completed))
+
+                                zarr_idx = episode_starts[episode_idx] + step_idx
+                                futures.add(
+                                    executor.submit(img_copy,
+                                        img_arr, zarr_idx, hdf5_arr, hdf5_idx,
+                                        target_h=h, target_w=w))
+                    completed, futures = concurrent.futures.wait(futures)
+                    for f in completed:
+                        if not f.result():
+                            raise RuntimeError('Failed to encode image!')
+                    pbar.update(len(completed))
+
+            # save depth data (float32, no compression), frame by frame to save memory
+            for key in depth_keys:
+                data_key = 'obs/' + key
+                shape = tuple(shape_meta['obs'][key]['shape'])
+                c, h, w = shape
+                # check if resize is needed by sampling the first frame
+                sample_frame = demos['demo_0'][data_key][0]
+                src_h, src_w = sample_frame.shape[:2]
+                need_resize = (src_h != h) or (src_w != w)
+                # pre-allocate zarr array
+                depth_arr = data_group.require_dataset(
+                    name=key,
+                    shape=(n_steps, h, w, c),
+                    chunks=(1, h, w, c),
+                    compressor=None,
+                    dtype=np.float32
+                )
+                # load frame by frame with per-frame progress bar
+                with tqdm(total=n_steps, desc=f"Loading depth data ({key})", mininterval=1.0) as pbar:
                     for episode_idx in range(len(demos)):
                         demo = demos[f'demo_{episode_idx}']
-                        hdf5_arr = demo['obs'][key]
-                        for hdf5_idx in range(hdf5_arr.shape[0]):
-                            if len(futures) >= max_inflight_tasks:
-                                # limit number of inflight tasks
-                                completed, futures = concurrent.futures.wait(futures, 
-                                    return_when=concurrent.futures.FIRST_COMPLETED)
-                                for f in completed:
-                                    if not f.result():
-                                        raise RuntimeError('Failed to encode image!')
-                                pbar.update(len(completed))
+                        hdf5_arr = demo[data_key]
+                        episode_length = episode_ends[episode_idx] - episode_starts[episode_idx]
+                        n_frames = hdf5_arr.shape[0]
+                        if n_frames == 1 and repeat_single_frame_image_obs:
+                            source_indices = [0] * episode_length
+                        elif n_frames == episode_length:
+                            source_indices = range(episode_length)
+                        else:
+                            raise ValueError(
+                                f"data/demo_{episode_idx}/obs/{key} has {n_frames} frames, "
+                                f"but actions has {episode_length}. "
+                                "Expected either 1 frame or one frame per action step."
+                            )
 
-                            zarr_idx = episode_starts[episode_idx] + hdf5_idx
-                            futures.add(
-                                executor.submit(img_copy,
-                                    img_arr, zarr_idx, hdf5_arr, hdf5_idx,
-                                    target_h=h, target_w=w))
-                completed, futures = concurrent.futures.wait(futures)
-                for f in completed:
-                    if not f.result():
-                        raise RuntimeError('Failed to encode image!')
-                pbar.update(len(completed))
-
-        # save depth data (float32, no compression), frame by frame to save memory
-        for key in depth_keys:
-            data_key = 'obs/' + key
-            shape = tuple(shape_meta['obs'][key]['shape'])
-            c, h, w = shape
-            # check if resize is needed by sampling the first frame
-            sample_frame = demos['demo_0'][data_key][0]
-            src_h, src_w = sample_frame.shape[:2]
-            need_resize = (src_h != h) or (src_w != w)
-            # pre-allocate zarr array
-            depth_arr = data_group.require_dataset(
-                name=key,
-                shape=(n_steps, h, w, c),
-                chunks=(1, h, w, c),
-                compressor=None,
-                dtype=np.float32
-            )
-            # load frame by frame with per-frame progress bar
-            with tqdm(total=n_steps, desc=f"Loading depth data ({key})", mininterval=1.0) as pbar:
-                for episode_idx in range(len(demos)):
-                    demo = demos[f'demo_{episode_idx}']
-                    hdf5_arr = demo[data_key]
-                    for hdf5_idx in range(hdf5_arr.shape[0]):
-                        frame = hdf5_arr[hdf5_idx].astype(np.float32)
-                        # handle (H, W) -> (H, W, 1)
-                        if frame.ndim == 2:
-                            frame = frame[:, :, np.newaxis]
-                        if need_resize:
-                            # squeeze channel dim for cv2.resize, then restore
-                            if frame.shape[-1] == 1:
-                                frame = frame[:, :, 0]
-                            frame = cv2.resize(frame, (w, h),
-                                interpolation=cv2.INTER_NEAREST)
+                        for step_idx, hdf5_idx in enumerate(source_indices):
+                            frame = hdf5_arr[hdf5_idx].astype(np.float32)
+                            # handle (H, W) -> (H, W, 1)
                             if frame.ndim == 2:
                                 frame = frame[:, :, np.newaxis]
-                        zarr_idx = episode_starts[episode_idx] + hdf5_idx
-                        depth_arr[zarr_idx] = frame
-                        pbar.update(1)
+                            if need_resize:
+                                # squeeze channel dim for cv2.resize, then restore
+                                if frame.shape[-1] == 1:
+                                    frame = frame[:, :, 0]
+                                frame = cv2.resize(frame, (w, h),
+                                    interpolation=cv2.INTER_NEAREST)
+                                if frame.ndim == 2:
+                                    frame = frame[:, :, np.newaxis]
+                            zarr_idx = episode_starts[episode_idx] + step_idx
+                            depth_arr[zarr_idx] = frame
+                            pbar.update(1)
 
     replay_buffer = ReplayBuffer(root)
     return replay_buffer

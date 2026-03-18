@@ -3,7 +3,8 @@ HDF5 数据预处理脚本
 - data/demo_*/actions -> data/demo_*/actions (保持原名)
 - data/demo_*/obs/actions -> data/demo_*/obs/actions (保持原名)
 - data/demo_*/obs/ee_pose 保持原名不变
-- data/demo_*/obs/camera_depth 和 camera_rgb: 将单帧图片扩展到与 actions 帧数相同
+- data/demo_*/obs/camera_depth 和 camera_rgb: 默认保持原始帧数
+  如需兼容旧流程，可通过 --expand-camera-frames 将单帧图片扩展到与 actions 帧数相同
 python process_hdf5.py your_data.hdf5
 # 输出: your_data_processed.hdf5
 
@@ -17,7 +18,7 @@ import argparse
 import os
 
 
-def process_hdf5(input_path, output_path):
+def process_hdf5(input_path, output_path, expand_camera_frames=False):
     with h5py.File(input_path, 'r') as fin, h5py.File(output_path, 'w') as fout:
         # 复制顶层属性
         for attr_key, attr_val in fin.attrs.items():
@@ -69,11 +70,14 @@ def process_hdf5(input_path, output_path):
                 else:
                     out_key = obs_key
 
-                # 扩展: camera_depth 和 camera_rgb
+                # 可选扩展: camera_depth 和 camera_rgb
                 if obs_key in ('camera_depth', 'camera_rgb'):
                     if src_data.shape[0] == 1:
-                        src_data = np.repeat(src_data, T, axis=0)
-                        print(f"  {demo_key}/obs/{obs_key}: 单帧扩展到 {T} 帧 -> obs/{out_key}")
+                        if expand_camera_frames:
+                            src_data = np.repeat(src_data, T, axis=0)
+                            print(f"  {demo_key}/obs/{obs_key}: 单帧扩展到 {T} 帧 -> obs/{out_key}")
+                        else:
+                            print(f"  {demo_key}/obs/{obs_key}: 保持单帧，不做扩展")
                     elif src_data.shape[0] != T:
                         print(f"  警告: {demo_key}/obs/{obs_key} 帧数={src_data.shape[0]}, "
                               f"action 帧数={T}, 不做扩展")
@@ -106,6 +110,8 @@ def main():
     parser.add_argument('input', help='输入 HDF5 文件路径')
     parser.add_argument('-o', '--output', default=None,
                         help='输出 HDF5 文件路径 (默认: 输入文件名_processed.hdf5)')
+    parser.add_argument('--expand-camera-frames', action='store_true',
+                        help='将单帧 camera_depth/camera_rgb 扩展到与 actions 帧数相同')
     args = parser.parse_args()
 
     if args.output is None:
@@ -119,7 +125,8 @@ def main():
     print(f"输出: {args.output}")
     print()
 
-    process_hdf5(args.input, args.output)
+    process_hdf5(args.input, args.output,
+                 expand_camera_frames=args.expand_camera_frames)
 
 
 if __name__ == '__main__':

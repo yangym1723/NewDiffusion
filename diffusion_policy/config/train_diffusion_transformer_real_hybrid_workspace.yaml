@@ -69,14 +69,14 @@ ema:
 
 dataloader:
   batch_size: 64
-  num_workers: 8
+  num_workers: 16
   shuffle: True
   pin_memory: True
   persistent_workers: True
 
 val_dataloader:
   batch_size: 64
-  num_workers: 8
+  num_workers: 16
   shuffle: False
   pin_memory: True
   persistent_workers: True
@@ -96,7 +96,7 @@ training:
   lr_scheduler: cosine
   # Transformer needs LR warmup
   lr_warmup_steps: 500
-  num_epochs: 600
+  num_epochs: 3000
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
